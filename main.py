@@ -653,6 +653,10 @@ def run_watchlist_check():
 
 def run_scheduler():
     schedule.every(WATCHLIST_CHECK_INTERVAL_HOURS).hours.do(run_watchlist_check)
+    try:
+        run_watchlist_check()
+    except Exception as e:
+        print("[scheduler] startup ingest failed: " + str(e))
     while True:
         schedule.run_pending()
         time_mod.sleep(60)
