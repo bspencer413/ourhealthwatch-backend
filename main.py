@@ -11,6 +11,7 @@ import jwt
 import threading
 import time as time_mod
 import schedule
+import requests
 from contextlib import contextmanager
 from typing import Optional, List
 
@@ -30,10 +31,12 @@ OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 
-API_VERSION = "0.1.0"
+API_VERSION = "0.1.1"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
+INGEST_WINDOW_DAYS = 30  # rolling window for openFDA drug recalls
+OPENFDA_DRUG_URL = "https://api.fda.gov/drug/enforcement.json"
 
 app = FastAPI(title="OurHealth.Watch API", version=API_VERSION)
 
@@ -229,6 +232,64 @@ def get_ingest_status() -> dict:
     except Exception as e:
         print("[get_ingest_status] failed: " + str(e))
         return {}
+
+
+# ── INGEST: openFDA DRUG RECALLS ──────────────────────────────────────────────
+def ingest_openfda_drugs(window_days: int = INGEST_WINDOW_DAYS) -> dict:
+    """Pull drug recalls from openFDA /drug/enforcement.json over a rolling
+    window. Upserts into oh_recalls with source='fda_drug'. Updates oh_ingest_log
+    on every run, success or failure. Mirrors MW's openFDA pattern for food."""
+    cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y%m%d")
+    today = datetime.utcnow().strftime("%Y%m%d")
+    # NOTE: openFDA needs literal '+TO+' in the search string; build URL manually
+    # since requests will URL-encode the '+' as '%2B' if passed via params.
+    search_str = "report_date:[" + cutoff + "+TO+" + today + "]"
+    full_url = OPENFDA_DRUG_URL + "?search=" + search_str + "&limit=1000"
+    if OPENFDA_KEY:
+        full_url = full_url + "&api_key=" + OPENFDA_KEY
+    headers = {"User-Agent": "Mozilla/5.0 (ourhealthwatch/0.1.1)"}
+    inserted = 0
+    skipped = 0
+    try:
+        r = requests.get(full_url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            update_ingest_log("fda_drug", success=False, error=err)
+            return {"source": "fda_drug", "error": err, "inserted": 0}
+        data = r.json()
+        results = data.get("results", [])
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in results:
+                rid = "fda_drug_" + (rec.get("recall_number") or rec.get("event_id") or "")
+                if rid == "fda_drug_":
+                    skipped = skipped + 1
+                    continue
+                brand = (rec.get("recalling_firm") or "").strip()
+                desc = (rec.get("product_description") or "").strip()
+                cls = (rec.get("classification") or "").replace("Class ", "").strip()
+                reason = (rec.get("reason_for_recall") or "").strip()
+                rdate = (rec.get("recall_initiation_date") or rec.get("report_date") or "").strip()
+                dist = (rec.get("distribution_pattern") or "").strip()
+                lots = (rec.get("code_info") or "").strip()  # often contains NDC for drugs
+                status = (rec.get("status") or "").strip()
+                try:
+                    c.execute("""INSERT INTO oh_recalls (source, recall_id, brand, product_description, upc,
+                        classification, reason, recall_date, distribution, lot_codes, status, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (recall_id) DO UPDATE SET
+                            status = EXCLUDED.status, fetched_at = CURRENT_TIMESTAMP""",
+                        ("fda_drug", rid, brand, desc, "", cls, reason, rdate, dist, lots, status, json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[fda_drug] skip " + rid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("fda_drug", success=True, record_count=inserted)
+        return {"source": "fda_drug", "fetched": len(results), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("fda_drug", success=False, error=str(e))
+        return {"source": "fda_drug", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -431,6 +492,67 @@ async def delete_watchlist(item_id: int, user=Depends(require_user)):
         raise HTTPException(status_code=500, detail="Delete failed: " + str(e))
 
 
+# ── RECALLS ENDPOINTS (firehose + opt-in pattern) ─────────────────────────────
+@app.get("/recalls/recent")
+async def recent_recalls(
+    source: Optional[str] = None,
+    limit: int = 25,
+    status: str = "Ongoing",
+    include_all_status: bool = False,
+):
+    """The 'show all' firehose. Default: last 30 days, Ongoing status only,
+    limit 25. Frontend renders this with an opt-in 'Add to Watchlist' button
+    on each card. include_all_status=true bypasses the Ongoing filter."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            where = ["1=1"]
+            params: list = []
+            if source:
+                where.append("source = %s")
+                params.append(source)
+            else:
+                where.append("source LIKE 'fda_%%'")
+            if not include_all_status:
+                where.append("status = %s")
+                params.append(status)
+            params.append(int(limit))
+            sql = ("SELECT id, source, recall_id, brand, product_description, upc, "
+                   "classification, reason, recall_date, distribution, lot_codes, status, fetched_at "
+                   "FROM oh_recalls WHERE " + " AND ".join(where) +
+                   " ORDER BY recall_date DESC NULLS LAST, fetched_at DESC LIMIT %s")
+            c.execute(sql, tuple(params))
+            rows = c.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "source": r["source"],
+                "recall_id": r["recall_id"],
+                "brand": r["brand"],
+                "product_description": r["product_description"],
+                "upc": r["upc"],
+                "classification": r["classification"],
+                "reason": r["reason"],
+                "recall_date": r["recall_date"],
+                "distribution": r["distribution"],
+                "lot_codes": r["lot_codes"],
+                "status": r["status"],
+                "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
+            })
+        # Include per-source last_checked timestamps so the UI can render
+        # "Last checked X min ago" even on an empty list. Source filter, if
+        # passed, scopes the timestamp to just that source.
+        ingest = get_ingest_status()
+        if source and source in ingest:
+            checked = {source: ingest[source]}
+        else:
+            checked = {k: v for k, v in ingest.items() if k.startswith("fda_")}
+        return {"results": items, "ingest_status": checked, "count": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Recent recalls fetch failed: " + str(e))
+
+
 # ── NOTIFICATIONS ENDPOINTS ───────────────────────────────────────────────────
 @app.get("/notifications")
 async def list_notifications(user=Depends(require_user)):
@@ -506,12 +628,26 @@ async def admin_ingest_status(_admin=Depends(require_admin)):
     return {"ingest_status": get_ingest_status(), "checked_at": datetime.utcnow().isoformat()}
 
 
-# ── CRON SKELETON ─────────────────────────────────────────────────────────────
+@app.post("/admin/refresh-recalls")
+async def admin_refresh_recalls(_admin=Depends(require_admin)):
+    """Manual trigger for openFDA drug recall ingest. Useful for forcing a
+    refresh between cron ticks or smoke-testing the ingest pipeline."""
+    drug_res = ingest_openfda_drugs()
+    return {"drug": drug_res, "ran_at": datetime.utcnow().isoformat()}
+
+
+# ── CRON ──────────────────────────────────────────────────────────────────────
 def run_watchlist_check():
-    """Background watchlist refresh. v0.1.0 is a stub — no adapters yet.
-    Drug recall ingest lands v0.1.1, NORS v0.1.4, WHO DON v0.1.5, etc.
-    Each adapter calls update_ingest_log() on completion."""
-    print("[cron] watchlist check tick at " + datetime.utcnow().isoformat() + " (v0.1.0 stub — adapters land in v0.1.1+)")
+    """Background tick. v0.1.1 runs openFDA drug recall ingest. Future
+    adapters (NORS, WHO DON, VSP, State Dept) land in v0.1.2+. Each adapter
+    calls update_ingest_log() on completion, success or failure."""
+    print("[cron] tick at " + datetime.utcnow().isoformat())
+    try:
+        drug_res = ingest_openfda_drugs()
+        print("[cron] fda_drug: " + json.dumps(drug_res))
+    except Exception as e:
+        print("[cron] fda_drug exception: " + str(e))
+        update_ingest_log("fda_drug", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
