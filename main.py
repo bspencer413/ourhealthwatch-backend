@@ -31,7 +31,7 @@ OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 
-API_VERSION = "0.1.5"
+API_VERSION = "0.1.6"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -497,6 +497,7 @@ class WatchlistAddIn(BaseModel):
     upc: Optional[str] = None
     keyword: Optional[str] = None
     category: Optional[str] = None
+    monitoring: Optional[bool] = True
 
 
 # ── HEALTH / META ─────────────────────────────────────────────────────────────
@@ -607,10 +608,11 @@ async def add_watchlist(body: WatchlistAddIn, user=Depends(require_user)):
     try:
         with get_db() as conn:
             c = conn.cursor()
-            c.execute("""INSERT INTO oh_watchlist (user_id, kind, brand, product_name, upc, keyword, category)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            c.execute("""INSERT INTO oh_watchlist (user_id, kind, brand, product_name, upc, keyword, category, monitoring)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (user["id"], body.kind or "product", body.brand, body.product_name,
-                 body.upc, body.keyword, body.category))
+                 body.upc, body.keyword, body.category,
+                 True if body.monitoring is None else bool(body.monitoring)))
             new_id = c.fetchone()[0]
             conn.commit()
         return {"id": new_id, "status": "added"}
