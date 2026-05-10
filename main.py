@@ -31,7 +31,7 @@ OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 
-API_VERSION = "0.1.4"
+API_VERSION = "0.1.5"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -696,11 +696,42 @@ def serialize_recall(d) -> Optional[dict]:
     return out
 
 
+def find_best_outbreak_for_watch(conn, keyword: Optional[str], category: Optional[str]):
+    """Return best matching oh_outbreaks row for a watchlist entry, or None.
+    Matches keyword against agent + title + summary (substring). Optionally
+    scopes to a specific source via category (e.g. 'cdc_nors')."""
+    if not keyword:
+        return None
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    like = "%" + keyword + "%"
+    where = ["(agent ILIKE %s OR title ILIKE %s OR summary ILIKE %s)"]
+    params: list = [like, like, like]
+    if category:
+        where.append("source = %s")
+        params.append(category)
+    sql = ("SELECT * FROM oh_outbreaks WHERE " + " AND ".join(where) +
+           " ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 1")
+    c.execute(sql, tuple(params))
+    row = c.fetchone()
+    return dict(row) if row else None
+
+
+def _is_outbreak_kind(kind: Optional[str], category: Optional[str]) -> bool:
+    """Classify a watchlist row as outbreak-shaped vs recall-shaped.
+    Outbreak if kind=='outbreak' OR category starts with cdc_/who_."""
+    if kind == "outbreak":
+        return True
+    if category and (category.startswith("cdc_") or category.startswith("who_")):
+        return True
+    return False
+
+
 @app.get("/watchlist/{item_id}/refresh")
 async def refresh_watchlist_item(item_id: int, user=Depends(require_user)):
     """On-demand recheck for a single watchlist item — used by the drawer.
-    Looks up the best matching Ongoing recall in oh_recalls and updates
-    has_alert + last_match_id + last_checked on the watchlist row."""
+    Type-aware: routes to oh_outbreaks search for outbreak-shaped items,
+    oh_recalls search for recall-shaped items. Returns {type, matched,
+    recall|outbreak, last_checked}."""
     try:
         with get_db() as conn:
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -710,21 +741,39 @@ async def refresh_watchlist_item(item_id: int, user=Depends(require_user)):
             wrow = c.fetchone()
             if not wrow:
                 raise HTTPException(status_code=404, detail="Watchlist item not found")
-            best = find_best_recall_for_watch(conn, wrow["brand"], wrow["product_name"],
-                                               wrow["upc"], wrow["keyword"])
+
             now = datetime.utcnow()
-            has_alert = best is not None
-            last_match_id = best["recall_id"] if best else None
+            is_outbreak = _is_outbreak_kind(wrow["kind"], wrow["category"])
+
+            if is_outbreak:
+                best = find_best_outbreak_for_watch(conn, wrow["keyword"], wrow["category"])
+                has_alert = best is not None
+                last_match_id = best["outbreak_id"] if best else None
+                payload_type = "outbreak"
+                outbreak_payload = serialize_recall(best)  # serializer is type-agnostic
+                recall_payload = None
+            else:
+                best = find_best_recall_for_watch(conn, wrow["brand"], wrow["product_name"],
+                                                   wrow["upc"], wrow["keyword"])
+                has_alert = best is not None
+                last_match_id = best["recall_id"] if best else None
+                payload_type = "recall"
+                recall_payload = serialize_recall(best)
+                outbreak_payload = None
+
             uc = conn.cursor()
             uc.execute("""UPDATE oh_watchlist
                 SET has_alert = %s, last_match_id = %s, last_checked = %s
                 WHERE id = %s""", (has_alert, last_match_id, now, item_id))
             conn.commit()
+
             return {
                 "id": item_id,
+                "type": payload_type,
                 "has_alert": has_alert,
                 "matched": has_alert,
-                "recall": serialize_recall(best),
+                "recall": recall_payload,
+                "outbreak": outbreak_payload,
                 "last_checked": now.isoformat()
             }
     except HTTPException:
