@@ -31,7 +31,7 @@ OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 
-API_VERSION = "0.1.3"
+API_VERSION = "0.1.4"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -631,6 +631,106 @@ async def delete_watchlist(item_id: int, user=Depends(require_user)):
         return {"status": "deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Delete failed: " + str(e))
+
+
+def find_best_recall_for_watch(conn, brand: Optional[str], product_name: Optional[str],
+                                upc: Optional[str], keyword: Optional[str]):
+    """Return best matching oh_recalls row for a watchlist entry, or None.
+    Forked from MW pattern: UPC exact → brand/keyword fuzzy with scoring.
+    Threshold of 30 keeps it from surfacing weak matches."""
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # UPC exact match (when both have it)
+    if upc:
+        c.execute("SELECT * FROM oh_recalls WHERE upc = %s AND status = 'Ongoing' LIMIT 1", (upc,))
+        row = c.fetchone()
+        if row:
+            return dict(row)
+    # Brand or keyword fuzzy
+    primary = brand or keyword
+    if primary:
+        like = "%" + primary + "%"
+        c.execute("""SELECT * FROM oh_recalls
+            WHERE (brand ILIKE %s OR product_description ILIKE %s)
+              AND status = 'Ongoing'
+            ORDER BY recall_date DESC NULLS LAST LIMIT 50""", (like, like))
+        rows = c.fetchall()
+        best = None
+        best_score = 0
+        for row in rows:
+            d = dict(row)
+            s = 0
+            b = (d.get("brand") or "").lower()
+            desc = (d.get("product_description") or "").lower()
+            p = primary.lower()
+            pn = (product_name or "").lower()
+            if p and p in b:
+                s = s + (50 if b == p else 30)
+            elif p and p in desc:
+                s = s + 25
+            if pn and pn in desc:
+                s = s + 20
+            elif pn and pn in b:
+                s = s + 10
+            if (d.get("classification") or "").startswith("I"):
+                s = s + 5
+            # require primary term to actually match — don't surface unrelated recalls
+            if p and p not in b and p not in desc:
+                continue
+            if s > best_score:
+                best_score = s
+                best = d
+        if best and best_score >= 30:
+            return best
+    return None
+
+
+def serialize_recall(d) -> Optional[dict]:
+    if not d:
+        return None
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+@app.get("/watchlist/{item_id}/refresh")
+async def refresh_watchlist_item(item_id: int, user=Depends(require_user)):
+    """On-demand recheck for a single watchlist item — used by the drawer.
+    Looks up the best matching Ongoing recall in oh_recalls and updates
+    has_alert + last_match_id + last_checked on the watchlist row."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT id, brand, product_name, upc, keyword, kind, category
+                FROM oh_watchlist WHERE id = %s AND user_id = %s AND status = 'active'""",
+                (item_id, user["id"]))
+            wrow = c.fetchone()
+            if not wrow:
+                raise HTTPException(status_code=404, detail="Watchlist item not found")
+            best = find_best_recall_for_watch(conn, wrow["brand"], wrow["product_name"],
+                                               wrow["upc"], wrow["keyword"])
+            now = datetime.utcnow()
+            has_alert = best is not None
+            last_match_id = best["recall_id"] if best else None
+            uc = conn.cursor()
+            uc.execute("""UPDATE oh_watchlist
+                SET has_alert = %s, last_match_id = %s, last_checked = %s
+                WHERE id = %s""", (has_alert, last_match_id, now, item_id))
+            conn.commit()
+            return {
+                "id": item_id,
+                "has_alert": has_alert,
+                "matched": has_alert,
+                "recall": serialize_recall(best),
+                "last_checked": now.isoformat()
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Refresh failed: " + str(e))
 
 
 # ── RECALLS ENDPOINTS (firehose + opt-in pattern) ─────────────────────────────
