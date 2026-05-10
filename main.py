@@ -31,12 +31,15 @@ OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 
-API_VERSION = "0.1.1"
+API_VERSION = "0.1.3"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
-INGEST_WINDOW_DAYS = 30  # rolling window for openFDA drug recalls
+INGEST_WINDOW_DAYS = 30  # rolling window for openFDA drug+device recalls
 OPENFDA_DRUG_URL = "https://api.fda.gov/drug/enforcement.json"
+OPENFDA_DEVICE_URL = "https://api.fda.gov/device/enforcement.json"
+NORS_URL = "https://data.cdc.gov/resource/5xkq-dg7x.json"  # CDC NORS foodborne/waterborne outbreaks
+NORS_FETCH_LIMIT = 200
 
 app = FastAPI(title="OurHealth.Watch API", version=API_VERSION)
 
@@ -290,6 +293,144 @@ def ingest_openfda_drugs(window_days: int = INGEST_WINDOW_DAYS) -> dict:
     except Exception as e:
         update_ingest_log("fda_drug", success=False, error=str(e))
         return {"source": "fda_drug", "error": str(e), "inserted": inserted}
+
+
+# ── INGEST: openFDA DEVICE RECALLS ────────────────────────────────────────────
+def ingest_openfda_devices(window_days: int = INGEST_WINDOW_DAYS) -> dict:
+    """Pull medical device recalls from openFDA /device/enforcement.json.
+    Same schema, same upsert pattern as drugs. source='fda_device'."""
+    cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y%m%d")
+    today = datetime.utcnow().strftime("%Y%m%d")
+    search_str = "report_date:[" + cutoff + "+TO+" + today + "]"
+    full_url = OPENFDA_DEVICE_URL + "?search=" + search_str + "&limit=1000"
+    if OPENFDA_KEY:
+        full_url = full_url + "&api_key=" + OPENFDA_KEY
+    headers = {"User-Agent": "Mozilla/5.0 (ourhealthwatch/0.1.3)"}
+    inserted = 0
+    skipped = 0
+    try:
+        r = requests.get(full_url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            update_ingest_log("fda_device", success=False, error=err)
+            return {"source": "fda_device", "error": err, "inserted": 0}
+        data = r.json()
+        results = data.get("results", [])
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in results:
+                rid = "fda_device_" + (rec.get("recall_number") or rec.get("event_id") or "")
+                if rid == "fda_device_":
+                    skipped = skipped + 1
+                    continue
+                brand = (rec.get("recalling_firm") or "").strip()
+                desc = (rec.get("product_description") or "").strip()
+                cls = (rec.get("classification") or "").replace("Class ", "").strip()
+                reason = (rec.get("reason_for_recall") or "").strip()
+                rdate = (rec.get("recall_initiation_date") or rec.get("report_date") or "").strip()
+                dist = (rec.get("distribution_pattern") or "").strip()
+                lots = (rec.get("code_info") or "").strip()
+                status = (rec.get("status") or "").strip()
+                try:
+                    c.execute("""INSERT INTO oh_recalls (source, recall_id, brand, product_description, upc,
+                        classification, reason, recall_date, distribution, lot_codes, status, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (recall_id) DO UPDATE SET
+                            status = EXCLUDED.status, fetched_at = CURRENT_TIMESTAMP""",
+                        ("fda_device", rid, brand, desc, "", cls, reason, rdate, dist, lots, status, json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[fda_device] skip " + rid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("fda_device", success=True, record_count=inserted)
+        return {"source": "fda_device", "fetched": len(results), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("fda_device", success=False, error=str(e))
+        return {"source": "fda_device", "error": str(e), "inserted": inserted}
+
+
+# ── INGEST: CDC NORS (foodborne / waterborne outbreaks) ───────────────────────
+def ingest_nors(limit: int = NORS_FETCH_LIMIT) -> dict:
+    """Pull NORS outbreaks from data.cdc.gov Socrata API (5xkq-dg7x).
+    NORS publishes annual aggregates per outbreak: year, month, state,
+    etiology, primary_mode, illnesses, hospitalizations, deaths.
+    Stored in oh_outbreaks with source='cdc_nors'."""
+    url = NORS_URL + "?$order=year DESC&$limit=" + str(limit)
+    headers = {"User-Agent": "Mozilla/5.0 (ourhealthwatch/0.1.3)", "Accept": "application/json"}
+    inserted = 0
+    skipped = 0
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            update_ingest_log("cdc_nors", success=False, error=err)
+            return {"source": "cdc_nors", "error": err, "inserted": 0}
+        rows = r.json()
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in rows:
+                # Socrata returns string year/month; construct a stable outbreak_id
+                year = (rec.get("year") or "").strip() if isinstance(rec.get("year"), str) else str(rec.get("year") or "")
+                month = (rec.get("month") or "").strip() if isinstance(rec.get("month"), str) else str(rec.get("month") or "")
+                state = (rec.get("state") or rec.get("primary_state") or "").strip()
+                etiology = (rec.get("etiology") or rec.get("genus") or "Unknown").strip()
+                mode = (rec.get("primary_mode") or rec.get("transmission_mode") or "").strip()
+                setting = (rec.get("setting") or "").strip()
+                cdc_id = (rec.get("cdc_id") or rec.get("outbreak_id") or "").strip()
+                oid_seed = cdc_id if cdc_id else (year + "-" + month + "-" + state + "-" + etiology)
+                oid = "cdc_nors_" + oid_seed.replace(" ", "_")[:120]
+                if oid == "cdc_nors_":
+                    skipped = skipped + 1
+                    continue
+                try:
+                    illnesses = int(rec.get("illnesses") or rec.get("ill_total") or 0)
+                except (TypeError, ValueError):
+                    illnesses = 0
+                title_parts = []
+                if etiology and etiology != "Unknown":
+                    title_parts.append(etiology)
+                if mode:
+                    title_parts.append("(" + mode + ")")
+                if state:
+                    title_parts.append("in " + state)
+                title = " ".join(title_parts) if title_parts else "NORS outbreak"
+                report_date = (year + "-" + month.zfill(2) if year and month else year) or ""
+                summary_bits = []
+                if setting:
+                    summary_bits.append("Setting: " + setting)
+                summary_bits.append("Illnesses: " + str(illnesses))
+                try:
+                    hosp = int(rec.get("hospitalizations") or 0)
+                    if hosp:
+                        summary_bits.append("Hospitalizations: " + str(hosp))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    deaths = int(rec.get("deaths") or 0)
+                    if deaths:
+                        summary_bits.append("Deaths: " + str(deaths))
+                except (TypeError, ValueError):
+                    pass
+                summary = " · ".join(summary_bits)
+                try:
+                    c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
+                        country_code, region, ship_name, cruise_line, cases, report_date, report_url, summary, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (outbreak_id) DO UPDATE SET
+                            cases = EXCLUDED.cases, summary = EXCLUDED.summary, fetched_at = CURRENT_TIMESTAMP""",
+                        ("cdc_nors", oid, title, etiology, state, "US", state, None, None,
+                         illnesses, report_date, "https://wwwn.cdc.gov/norsdashboard/", summary, json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[cdc_nors] skip " + oid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("cdc_nors", success=True, record_count=inserted)
+        return {"source": "cdc_nors", "fetched": len(rows), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("cdc_nors", success=False, error=str(e))
+        return {"source": "cdc_nors", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -553,6 +694,68 @@ async def recent_recalls(
         raise HTTPException(status_code=500, detail="Recent recalls fetch failed: " + str(e))
 
 
+# ── OUTBREAKS ENDPOINTS (firehose + opt-in pattern) ───────────────────────────
+@app.get("/outbreaks/recent")
+async def recent_outbreaks(
+    source: Optional[str] = None,
+    limit: int = 25,
+    agent: Optional[str] = None,
+    region: Optional[str] = None,
+):
+    """Outbreak firehose. Source can be 'cdc_nors', 'who_don', 'cdc_vsp', etc.
+    Optional filters by agent (etiology) and region (state/country).
+    Adapters land progressively: NORS in v0.1.3, WHO DON in v0.1.5, VSP later."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            where = ["1=1"]
+            params: list = []
+            if source:
+                where.append("source = %s")
+                params.append(source)
+            if agent:
+                where.append("agent ILIKE %s")
+                params.append("%" + agent + "%")
+            if region:
+                where.append("region ILIKE %s")
+                params.append("%" + region + "%")
+            params.append(int(limit))
+            sql = ("SELECT id, source, outbreak_id, title, agent, location, country_code, region, "
+                   "ship_name, cruise_line, cases, report_date, report_url, summary, fetched_at "
+                   "FROM oh_outbreaks WHERE " + " AND ".join(where) +
+                   " ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT %s")
+            c.execute(sql, tuple(params))
+            rows = c.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "source": r["source"],
+                "outbreak_id": r["outbreak_id"],
+                "title": r["title"],
+                "agent": r["agent"],
+                "location": r["location"],
+                "country_code": r["country_code"],
+                "region": r["region"],
+                "ship_name": r["ship_name"],
+                "cruise_line": r["cruise_line"],
+                "cases": r["cases"],
+                "report_date": r["report_date"],
+                "report_url": r["report_url"],
+                "summary": r["summary"],
+                "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
+            })
+        ingest = get_ingest_status()
+        if source and source in ingest:
+            checked = {source: ingest[source]}
+        else:
+            checked = {k: v for k, v in ingest.items()
+                       if k.startswith("cdc_") or k.startswith("who_")}
+        return {"results": items, "ingest_status": checked, "count": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Recent outbreaks fetch failed: " + str(e))
+
+
 # ── NOTIFICATIONS ENDPOINTS ───────────────────────────────────────────────────
 @app.get("/notifications")
 async def list_notifications(user=Depends(require_user)):
@@ -630,17 +833,27 @@ async def admin_ingest_status(_admin=Depends(require_admin)):
 
 @app.post("/admin/refresh-recalls")
 async def admin_refresh_recalls(_admin=Depends(require_admin)):
-    """Manual trigger for openFDA drug recall ingest. Useful for forcing a
-    refresh between cron ticks or smoke-testing the ingest pipeline."""
+    """Manual trigger for openFDA recall ingests (drug + device). Useful for
+    forcing a refresh between cron ticks or smoke-testing."""
     drug_res = ingest_openfda_drugs()
-    return {"drug": drug_res, "ran_at": datetime.utcnow().isoformat()}
+    device_res = ingest_openfda_devices()
+    return {"drug": drug_res, "device": device_res, "ran_at": datetime.utcnow().isoformat()}
+
+
+@app.post("/admin/refresh-outbreaks")
+async def admin_refresh_outbreaks(_admin=Depends(require_admin)):
+    """Manual trigger for outbreak ingests (NORS + future WHO DON, VSP).
+    Returns per-source result dicts."""
+    nors_res = ingest_nors()
+    return {"nors": nors_res, "ran_at": datetime.utcnow().isoformat()}
 
 
 # ── CRON ──────────────────────────────────────────────────────────────────────
 def run_watchlist_check():
-    """Background tick. v0.1.1 runs openFDA drug recall ingest. Future
-    adapters (NORS, WHO DON, VSP, State Dept) land in v0.1.2+. Each adapter
-    calls update_ingest_log() on completion, success or failure."""
+    """Background tick. v0.1.3 runs openFDA drug+device recall ingest plus
+    CDC NORS foodborne/waterborne outbreaks. Future adapters (WHO DON,
+    State Dept, VSP) land progressively. Each adapter calls update_ingest_log()
+    on completion, success or failure."""
     print("[cron] tick at " + datetime.utcnow().isoformat())
     try:
         drug_res = ingest_openfda_drugs()
@@ -648,11 +861,25 @@ def run_watchlist_check():
     except Exception as e:
         print("[cron] fda_drug exception: " + str(e))
         update_ingest_log("fda_drug", success=False, error=str(e))
+    try:
+        device_res = ingest_openfda_devices()
+        print("[cron] fda_device: " + json.dumps(device_res))
+    except Exception as e:
+        print("[cron] fda_device exception: " + str(e))
+        update_ingest_log("fda_device", success=False, error=str(e))
+    try:
+        nors_res = ingest_nors()
+        print("[cron] cdc_nors: " + json.dumps(nors_res))
+    except Exception as e:
+        print("[cron] cdc_nors exception: " + str(e))
+        update_ingest_log("cdc_nors", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
 def run_scheduler():
     schedule.every(WATCHLIST_CHECK_INTERVAL_HOURS).hours.do(run_watchlist_check)
+    # Run an initial ingest on startup so /recalls/recent has fresh data
+    # immediately rather than waiting up to 12 hrs for the first cron tick.
     try:
         run_watchlist_check()
     except Exception as e:
