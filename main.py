@@ -1409,6 +1409,25 @@ def _serialize_outbreak_row(r) -> dict:
     }
 
 
+# 50 US states + DC + common variants of "United States". Used by /search-events
+# to decide whether FDA recall data (US-only) is relevant for the user's query.
+_US_LOCATIONS = {
+    "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
+    "delaware","district of columbia","dc","florida","georgia","hawaii","idaho",
+    "illinois","indiana","iowa","kansas","kentucky","louisiana","maine","maryland",
+    "massachusetts","michigan","minnesota","mississippi","missouri","montana",
+    "nebraska","nevada","new hampshire","new jersey","new mexico","new york",
+    "north carolina","north dakota","ohio","oklahoma","oregon","pennsylvania",
+    "rhode island","south carolina","south dakota","tennessee","texas","utah",
+    "vermont","virginia","washington","west virginia","wisconsin","wyoming",
+    "united states","united states of america","usa","u.s.","u.s.a.","us",
+}
+def _is_us_state_or_country(s: str) -> bool:
+    if not s:
+        return False
+    return s.strip().lower() in _US_LOCATIONS
+
+
 @app.post("/search-events")
 async def search_events(body: SearchQuery, user=Depends(require_user)):
     """v0.1.7 search-first flow: run a place query WITHOUT persisting.
@@ -1490,31 +1509,35 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 seen_oids.add(r["outbreak_id"])
                 outbreaks.append(_serialize_outbreak_row(r))
 
-            # Recalls: FDA distribution-or-Nationwide
+            # Recalls: FDA recalls are US-only data. Only query when the user's
+            # state matches a US state or "United States" / "USA"; otherwise the
+            # Nationwide-or-state SQL would return nationwide US recalls for any
+            # foreign country search (e.g. Guatemala returning 25 US recalls).
             recalls: list = []
-            c.execute("""SELECT id, source, recall_id, brand, product_description,
-                upc, classification, reason, recall_date, distribution, lot_codes,
-                status, fetched_at FROM oh_recalls
-                WHERE source IN ('fda_drug', 'fda_device')
-                  AND (distribution ILIKE %s OR distribution ILIKE 'Nationwide%%')
-                ORDER BY recall_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                (like_state,))
-            for r in c.fetchall():
-                recalls.append({
-                    "id": r["id"],
-                    "source": r["source"],
-                    "recall_id": r["recall_id"],
-                    "brand": r["brand"],
-                    "product_description": r["product_description"],
-                    "upc": r["upc"],
-                    "classification": r["classification"],
-                    "reason": r["reason"],
-                    "recall_date": r["recall_date"],
-                    "distribution": r["distribution"],
-                    "lot_codes": r["lot_codes"],
-                    "status": r["status"],
-                    "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
-                })
+            if _is_us_state_or_country(state):
+                c.execute("""SELECT id, source, recall_id, brand, product_description,
+                    upc, classification, reason, recall_date, distribution, lot_codes,
+                    status, fetched_at FROM oh_recalls
+                    WHERE source IN ('fda_drug', 'fda_device')
+                      AND (distribution ILIKE %s OR distribution ILIKE 'Nationwide%%')
+                    ORDER BY recall_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state,))
+                for r in c.fetchall():
+                    recalls.append({
+                        "id": r["id"],
+                        "source": r["source"],
+                        "recall_id": r["recall_id"],
+                        "brand": r["brand"],
+                        "product_description": r["product_description"],
+                        "upc": r["upc"],
+                        "classification": r["classification"],
+                        "reason": r["reason"],
+                        "recall_date": r["recall_date"],
+                        "distribution": r["distribution"],
+                        "lot_codes": r["lot_codes"],
+                        "status": r["status"],
+                        "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
+                    })
 
             return {
                 "query": {"region": region or None, "state": state, "city": city or None},
