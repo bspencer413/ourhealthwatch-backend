@@ -36,7 +36,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.9"
+API_VERSION = "0.1.10"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -1270,6 +1270,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source = 'cdc_nors'
                       AND (region ILIKE %s OR location ILIKE %s)
+                    AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                     (like, like))
                 for r in c.fetchall():
@@ -1295,6 +1296,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source = 'who_don'
                       AND (""" + " OR ".join(where) + """)
+                    AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
                 c.execute(sql_who, tuple(params))
                 for r in c.fetchall():
@@ -1324,6 +1326,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source NOT IN ('cdc_nors', 'who_don', 'cdc_vsp')
                       AND (""" + " OR ".join(fallback_where) + """)
+                    AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
                 c.execute(sql_fb, tuple(fallback_params))
                 for r in c.fetchall():
@@ -1343,6 +1346,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     status, fetched_at FROM oh_recalls
                     WHERE source IN ('fda_drug', 'fda_device')
                       AND (distribution ILIKE %s OR distribution ILIKE 'Nationwide%%')
+                    AND recall_date >= CURRENT_DATE - INTERVAL '1 year'
                     ORDER BY recall_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                     (like,))
                 for r in c.fetchall():
@@ -1467,6 +1471,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source = 'cdc_nors'
                   AND (region ILIKE %s OR location ILIKE %s)
+                AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                 (like_state, like_state))
             for r in c.fetchall():
@@ -1481,6 +1486,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source = 'who_don'
                   AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
+                AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                 (like_state, state, like_state))
             for r in c.fetchall():
@@ -1501,6 +1507,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source NOT IN ('cdc_nors', 'who_don', 'cdc_vsp')
                   AND (""" + " OR ".join(fallback_where) + """)
+                AND report_date >= CURRENT_DATE - INTERVAL '1 year'
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
             c.execute(sql_fb, tuple(fallback_params))
             for r in c.fetchall():
@@ -1520,6 +1527,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                     status, fetched_at FROM oh_recalls
                     WHERE source IN ('fda_drug', 'fda_device')
                       AND (distribution ILIKE %s OR distribution ILIKE 'Nationwide%%')
+                    AND recall_date >= CURRENT_DATE - INTERVAL '1 year'
                     ORDER BY recall_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                     (like_state,))
                 for r in c.fetchall():
