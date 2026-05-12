@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.14"
+API_VERSION = "0.1.15"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -2134,13 +2134,18 @@ async def recent_outbreaks(
     agent: Optional[str] = None,
     region: Optional[str] = None,
 ):
-    """Outbreak firehose. Source can be 'cdc_nors', 'who_don', 'cdc_vsp', etc.
+    """Outbreak firehose. Source can be 'who_don', 'cdc_syn', 'cdc_vsp', etc.
     Optional filters by agent (etiology) and region (state/country).
-    Adapters land progressively: NORS in v0.1.3, WHO DON in v0.1.5, VSP later."""
+    v0.1.15: same 1-year date filter as /search-events and /places/{id}/events
+    so the firehose, drawer, and search stay consistent. Orphaned older rows
+    (e.g. cdc_syn entries from before the v0.1.14 ingest-time 180-day cutoff
+    landed) physically remain in the DB but are masked from the UI here."""
     try:
         with get_db() as conn:
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            where = ["1=1"]
+            where = [
+                "COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')"
+            ]
             params: list = []
             if source:
                 where.append("source = %s")
