@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.25"
+API_VERSION = "0.1.26"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -61,19 +61,28 @@ WHO_DON_FETCH_LIMIT = 50
 # matching is structured — no title parsing needed.
 CDC_SYN_URL = "https://tools.cdc.gov/api/v2/resources/media"
 CDC_SYN_FETCH_LIMIT = 50
-# v0.1.25: EPA ECHO Enforcement Case Search. Civil + criminal enforcement
-# actions taken by EPA against regulated facilities — the alert moment for
+# v0.1.25: EPA enforcement actions — civil + criminal enforcement actions
+# taken by EPA against regulated facilities. The alert moment for
 # environmental incidents (chemical/water/air violations escalated to formal
-# action). No API key, JSON output. Replaces dead cdc_han (HAN RSS feed
-# abandoned by HHS since 2025-03-31; OHW strategic pivot: don't build on
-# thinning HHS sources, expand to environmental/policy verticals).
+# action). Replaces dead cdc_han (HAN RSS abandoned by HHS since 2025-03-31;
+# OHW strategic pivot: don't build on thinning HHS sources, expand to
+# environmental/policy verticals).
+#
+# v0.1.26: switched from ECHO REST (case_rest_services.get_cases — confirmed
+# 404, EPA hollowed out the docs for that surface) to the Envirofacts
+# Data Service API. Same underlying ICIS-FE&C data, well-documented and
+# alive (last refreshed May 5, 2026). Table-level access pattern:
+#   https://data.epa.gov/efservice/{TABLE}/{filter}/{rows}/{format}
+# We query ICIS_ENFORCEMENT (the formal enforcement actions table) with
+# defensive client-side date filtering since we're unsure about server
+# date filter syntax for this specific table.
 #
 # Storage: source='epa_enforce' in oh_outbreaks (case shape maps cleanly to
 # the OutbreakCard renderer — title=case name, location=state, summary=
-# statutes+penalty). Outbreak_id prefix 'epa_enforce_' preserves lineage.
-EPA_ENFORCE_URL = "https://ofmpub.epa.gov/echo/case_rest_services.get_cases"
-EPA_ENFORCE_FETCH_LIMIT = 100
-EPA_ENFORCE_WINDOW_DAYS = 90
+# program+outcome+penalty). Outbreak_id prefix 'epa_enforce_' preserves lineage.
+EPA_ENFORCE_URL = "https://data.epa.gov/efservice/ICIS_ENFORCEMENT/ROWS/0:200/JSON"
+EPA_ENFORCE_FETCH_LIMIT = 200
+EPA_ENFORCE_WINDOW_DAYS = 365
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -1178,25 +1187,22 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
 
 def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                        window_days: int = EPA_ENFORCE_WINDOW_DAYS) -> dict:
-    """Pull recent EPA enforcement cases (civil + criminal) from ECHO.
-    Upserts into oh_outbreaks with source='epa_enforce'. Each case becomes
-    an "outbreak"-shaped row so the existing OutbreakCard + drawer + search
-    paths render it without changes. Updates oh_ingest_log on every run,
+    """Pull recent EPA enforcement actions from the Envirofacts ICIS_ENFORCEMENT
+    table. Upserts into oh_outbreaks with source='epa_enforce'. Each enforcement
+    action becomes an "outbreak"-shaped row so the existing OutbreakCard +
+    drawer + search paths render it without changes.
+
+    Defensive: Envirofacts column casing varies by table; we normalize record
+    keys to UPPERCASE once and check multiple candidate field names for each
+    output value. Date window applied client-side (server filter syntax for
+    this specific table is unconfirmed). Updates oh_ingest_log on every run,
     success or failure."""
     headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
-    cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y-%m-%d")
-    params = {
-        "output": "JSON",
-        "responseset": str(limit),
-        # Settlement date lower bound. ECHO uses p_sl_dfr_from / p_sl_dto_to
-        # for settlement date range; p_act_dfrom / p_act_dto for activity
-        # date. We send settlement-date-from as the recency filter.
-        "p_sl_dfr_from": cutoff,
-    }
+    cutoff_dt = datetime.utcnow() - timedelta(days=window_days)
     inserted = 0
     skipped = 0
     try:
-        r = requests.get(EPA_ENFORCE_URL, params=params, headers=headers, timeout=45)
+        r = requests.get(EPA_ENFORCE_URL, headers=headers, timeout=60)
         if r.status_code != 200:
             err = "HTTP " + str(r.status_code) + " " + r.text[:200]
             update_ingest_log("epa_enforce", success=False, error=err)
@@ -1208,20 +1214,35 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
             update_ingest_log("epa_enforce", success=False, error=err)
             return {"source": "epa_enforce", "error": err, "inserted": 0}
 
-        # ECHO wraps results under a Results object; case list lives under
-        # several possible keys depending on service version. Try each.
+        # Envirofacts returns either a top-level array, or sometimes wraps the
+        # array under the table name. Handle both.
         items = []
-        if isinstance(data, dict):
-            results = data.get("Results") or data.get("results") or {}
-            if isinstance(results, dict):
-                cases = (results.get("Cases") or results.get("cases") or
-                         results.get("Case") or results.get("CaseList") or [])
-                if isinstance(cases, list):
-                    items = cases
-                elif isinstance(cases, dict):
-                    items = [cases]
-            elif isinstance(results, list):
-                items = results
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # Try table-name wrapper variants
+            for k in ("ICIS_ENFORCEMENT", "icis_enforcement", "Results", "results"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    items = v
+                    break
+                if isinstance(v, dict):
+                    # Sometimes nested one more level
+                    for k2 in ("ICIS_ENFORCEMENT", "icis_enforcement", "row", "Row"):
+                        vv = v.get(k2)
+                        if isinstance(vv, list):
+                            items = vv
+                            break
+                    if items:
+                        break
+
+        def _get(norm, *keys):
+            """Return first non-empty string from normalized (upper-keyed) record."""
+            for k in keys:
+                v = norm.get(k.upper())
+                if v not in (None, "", " "):
+                    return str(v).strip()
+            return ""
 
         with get_db() as conn:
             c = conn.cursor()
@@ -1230,25 +1251,39 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     skipped = skipped + 1
                     continue
 
-                # Case ID — primary key into ECHO. Multiple variants seen.
-                case_id = str(rec.get("CaseNumber") or rec.get("CaseId") or
-                              rec.get("ICISCaseNumber") or "").strip()
+                # Normalize keys to uppercase once so case variants don't matter.
+                norm = {}
+                for k, v in rec.items():
+                    if isinstance(k, str):
+                        norm[k.upper()] = v
+
+                # ID — multiple candidate keys for the unique enforcement record.
+                case_id = _get(norm, "ACTIVITY_ID", "ENF_IDENTIFIER",
+                               "CASE_NUMBER", "ENFORCEMENT_ACTION_ID",
+                               "ENF_CONCLUSION_ID")
                 if not case_id:
                     skipped = skipped + 1
                     continue
                 oid = "epa_enforce_" + case_id[:120]
 
-                # Title — case name preferred, fall back to defendant.
-                title = str(rec.get("CaseName") or rec.get("Defendant") or
-                            rec.get("DefendantEntity") or "").strip()
+                # Title — case name / activity name / defendant.
+                title = _get(norm, "CASE_NAME", "ACTIVITY_NAME",
+                             "ENF_CONCLUSION_NAME", "DEFENDANT_ENTITY",
+                             "DEFENDANT_NAME", "FACILITY_NAME")
                 if not title:
-                    title = "EPA Enforcement Case " + case_id
+                    title = "EPA Enforcement Action " + case_id
 
-                # Location — facility city + state.
-                state_name = str(rec.get("FacilityState") or rec.get("State") or
-                                 rec.get("DefendantState") or "").strip()
-                city_name = str(rec.get("FacilityCity") or rec.get("City") or
-                                rec.get("DefendantCity") or "").strip()
+                # State — facility location.
+                state_name = _get(norm, "FACILITY_STATE", "STATE",
+                                  "STATE_CODE", "DEFENDANT_STATE")
+                # Expand 2-letter state codes to full names (matches CDC syn
+                # pattern so /search-events region ILIKE %state% works cleanly).
+                if len(state_name) == 2:
+                    full = _US_ADMIN1_TO_NAME.get(state_name.upper())
+                    if full:
+                        state_name = full
+
+                city_name = _get(norm, "FACILITY_CITY", "CITY", "DEFENDANT_CITY")
                 if city_name and state_name:
                     location = city_name + ", " + state_name
                 elif state_name:
@@ -1256,42 +1291,73 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                 elif city_name:
                     location = city_name
                 else:
-                    location = ""
+                    location = "United States"
 
-                # ECHO is US-only.
+                # ICIS is US-only.
                 country_code = "US"
 
-                # Date — settlement preferred, fall back to filed date.
-                date_raw = str(rec.get("SettlementDate") or
-                               rec.get("CaseFiledDate") or
-                               rec.get("FiledDate") or
-                               rec.get("ActivityDate") or "").strip()
-                report_date = date_raw[:10] if len(date_raw) >= 10 else date_raw
+                # Date — try multiple candidates; first one that parses wins.
+                date_raw = _get(norm, "ACHIEVED_DATE", "SETTLEMENT_DATE_ENTERED",
+                                "ACTIVITY_STATUS_DATE", "LAST_CHANGED_DATE",
+                                "CASE_FILED_DATE", "FY_DATE")
+                report_date = ""
+                if date_raw:
+                    # Strip time component if present; accept "YYYY-MM-DD..." or "MM/DD/YYYY"
+                    if "/" in date_raw and len(date_raw) >= 10:
+                        # MM/DD/YYYY -> YYYY-MM-DD
+                        try:
+                            dt = datetime.strptime(date_raw[:10], "%m/%d/%Y")
+                            report_date = dt.strftime("%Y-%m-%d")
+                        except Exception:
+                            report_date = date_raw[:10]
+                    else:
+                        report_date = date_raw[:10]
 
-                # Source URL — ECHO case report deep link.
-                report_url = "https://echo.epa.gov/enforcement-case-report?id=" + case_id
+                # Client-side date window: skip records older than cutoff.
+                # Records without a parseable date are kept (better to surface
+                # than drop silently — we'll see them and tune).
+                if report_date and len(report_date) >= 10:
+                    try:
+                        rec_dt = datetime.strptime(report_date[:10], "%Y-%m-%d")
+                        if rec_dt < cutoff_dt:
+                            skipped = skipped + 1
+                            continue
+                    except Exception:
+                        pass
 
-                # Summary — combine statutes + violation type + penalty.
-                statutes = str(rec.get("Statutes") or rec.get("PrimaryLaw") or
-                               rec.get("StatuteCode") or "").strip()
-                violation_type = str(rec.get("ViolationType") or
-                                     rec.get("CaseType") or
-                                     rec.get("EnforcementActionType") or "").strip()
-                penalty = str(rec.get("FederalPenaltyAssessedAmount") or
-                              rec.get("PenaltyAmount") or
-                              rec.get("TotalPenaltyAssessedAmount") or "").strip()
-                summary_parts = []
-                if violation_type:
-                    summary_parts.append(violation_type)
-                if statutes:
-                    summary_parts.append("Statute: " + statutes)
-                if penalty:
-                    summary_parts.append("Penalty: $" + penalty)
-                summary = " - ".join(summary_parts)[:500]
+                # Source URL — ECHO case report uses the activity_id / enf_id.
+                report_url = ("https://echo.epa.gov/enforcement-case-report?id=" +
+                              case_id)
 
-                # Agent — what kind of violation (renders as the green pill
-                # on the OutbreakCard, same slot as pathogen for outbreaks).
-                agent = violation_type or statutes or "Enforcement action"
+                # Summary — program + type + outcome + penalty, whatever's
+                # populated. ENF_SUMMARY_TEXT if available is best.
+                summary_text = _get(norm, "ENF_SUMMARY_TEXT", "SUMMARY")
+                if summary_text:
+                    summary = summary_text[:500]
+                else:
+                    program = _get(norm, "PROGRAM_DESC", "PRIMARY_LAW")
+                    enf_type = _get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC",
+                                    "CASE_TYPE")
+                    outcome = _get(norm, "ENF_OUTCOME_DESC")
+                    penalty = _get(norm, "FEDERAL_PENALTY_ASSESSED_AMT",
+                                   "FED_PENALTY_ASSESSED_AMT",
+                                   "PENALTY_ASSESSED_AMT", "PENALTY_AMOUNT")
+                    parts = []
+                    if enf_type:
+                        parts.append(enf_type)
+                    if program:
+                        parts.append(program)
+                    if outcome:
+                        parts.append(outcome)
+                    if penalty:
+                        parts.append("Penalty: $" + penalty)
+                    summary = " - ".join(parts)[:500]
+
+                # Agent — what kind of action (renders as the green pill on
+                # OutbreakCard, same slot as pathogen for outbreaks).
+                agent = (_get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC") or
+                         _get(norm, "PROGRAM_DESC", "PRIMARY_LAW") or
+                         "Enforcement action")
 
                 try:
                     c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
