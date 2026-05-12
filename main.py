@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.19"
+API_VERSION = "0.1.20"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -2135,7 +2135,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                         FROM oh_outbreaks
                         WHERE source = 'cdc_syn'
                           AND (region ILIKE %s OR location ILIKE %s
-                               OR region ILIKE '%United States%' OR location ILIKE '%United States%')
+                               OR region ILIKE '%%United States%%' OR location ILIKE '%%United States%%')
                         AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                         ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                         (like_state, like_state))
