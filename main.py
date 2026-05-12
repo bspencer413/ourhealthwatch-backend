@@ -37,7 +37,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.12"
+API_VERSION = "0.1.13"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -50,6 +50,14 @@ NORS_FETCH_LIMIT = 200
 # near-real-time. Provides JSON via the WHO REST API (OData v4 style).
 WHO_DON_URL = "https://www.who.int/api/news/diseaseoutbreaknews"
 WHO_DON_FETCH_LIMIT = 50
+# CDC Content Syndication API — canonical US outbreak alerts, published in
+# near-real-time. JSON-by-default REST API. Replaces NORS as the live US
+# signal (NORS is the retrospective registry, published 1-3 years after the
+# fact). Two complementary queries (topic-based + text-based), deduped by id.
+# Records include geoTags (countryCode + admin1Code state code), so geo
+# matching is structured — no title parsing needed.
+CDC_SYN_URL = "https://tools.cdc.gov/api/v2/resources/media"
+CDC_SYN_FETCH_LIMIT = 50
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -698,6 +706,253 @@ def ingest_who_don(limit: int = WHO_DON_FETCH_LIMIT) -> dict:
     except Exception as e:
         update_ingest_log("who_don", success=False, error=str(e))
         return {"source": "who_don", "error": str(e), "inserted": inserted}
+
+
+# ── INGEST: CDC CONTENT SYNDICATION (US outbreak alerts) ──────────────────────
+# CDC's official Content Services API exposes their Newsroom + Outbreaks pages
+# as structured JSON. Every item has `geoTags` with countryCode + admin1Code,
+# so geo matching is direct (no title parsing). Two complementary queries
+# (topic="Outbreaks" + q="outbreak") are deduped by media id, then filtered
+# to outbreak-related content via a pathogen-term heuristic to cull press-
+# release noise that q= sometimes catches ("how to prevent outbreaks" etc.).
+
+# admin1Code expansion: CDC returns 2-letter state codes for US first-level
+# administrative divisions. Map to full names so the existing /search-events
+# `region ILIKE %state%` matches user queries like "Alabama" cleanly.
+_US_ADMIN1_TO_NAME = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "DC": "District of Columbia", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana",
+    "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+    "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana",
+    "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "PR": "Puerto Rico",
+    "VI": "U.S. Virgin Islands", "GU": "Guam", "AS": "American Samoa",
+    "MP": "Northern Mariana Islands",
+}
+
+# Heuristic filter: an item is "outbreak content" if its name or description
+# mentions one of these terms. Filters out CDC press-releases caught by
+# q=outbreak that aren't actually outbreak notices.
+_CDC_OUTBREAK_TERMS = [
+    "outbreak", "salmonella", "e. coli", "listeria", "measles",
+    "hantavirus", "hepatitis", "norovirus", "campylobacter", "shigella",
+    "cholera", "ebola", "marburg", "monkeypox", "mpox", "lassa",
+    "h5n1", "h7n9", "avian influenza", "bird flu", "tuberculosis",
+    "legionnaire", "legionella", "rsv outbreak", "covid outbreak",
+    "investigation notice", "food safety alert",
+]
+
+
+def _is_outbreak_content(name: str, description: str) -> bool:
+    """Heuristic: name or description contains an outbreak-related term."""
+    blob = ((name or "") + " " + (description or "")).lower()
+    for term in _CDC_OUTBREAK_TERMS:
+        if term in blob:
+            return True
+    return False
+
+
+def _cdc_extract_geo(rec: dict) -> tuple:
+    """Pull (state_name, country_code, country_label) from geoTags.
+    Expands admin1Code -> full US state name. For non-US tags, uses
+    the geo entity name as-is. Returns ('', '', '') if no geoTags."""
+    state = ""
+    country_code = ""
+    country = ""
+    geo_tags = rec.get("geoTags") or []
+    for gt in geo_tags:
+        if not isinstance(gt, dict):
+            continue
+        cc = str(gt.get("countryCode") or "").strip().upper()
+        a1 = str(gt.get("admin1Code") or "").strip().upper()
+        nm = str(gt.get("name") or "").strip()
+        if not country_code and cc:
+            country_code = cc
+        # US state code -> full name
+        if not state and cc == "US" and a1 in _US_ADMIN1_TO_NAME:
+            state = _US_ADMIN1_TO_NAME[a1]
+        # Non-US: use the geo name as the country/region label
+        if not country and cc and cc != "US" and nm:
+            country = nm
+        if state and country_code:
+            break
+    return (state, country_code, country)
+
+
+def _cdc_fetch(params: dict, headers: dict, label: str) -> list:
+    """Single CDC syndication fetch with defensive error handling. Returns
+    a list of media records (empty on failure)."""
+    try:
+        r = requests.get(CDC_SYN_URL, params=params, headers=headers, timeout=30)
+        if r.status_code != 200:
+            print("[cdc_syn] " + label + " HTTP " + str(r.status_code) + ": " + r.text[:200])
+            return []
+        try:
+            data = r.json()
+        except Exception as je:
+            print("[cdc_syn] " + label + " JSON parse failed: " + str(je))
+            return []
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return []
+        return results
+    except Exception as e:
+        print("[cdc_syn] " + label + " request failed: " + str(e))
+        return []
+
+
+def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
+    """Pull recent CDC outbreak notices via the Content Syndication API.
+    Combines a topic-based query and a text-based query, dedupes by media
+    id, filters to outbreak content, and upserts into oh_outbreaks with
+    source='cdc_syn'.
+
+    geoTags drive geo-matching directly:
+      - countryCode -> country_code column (always 'US' for domestic items)
+      - admin1Code -> expanded state name in `region` and `location`
+    No title parsing needed (unlike WHO DON).
+
+    Resilient: any record that fails to parse is skipped, never crashes the
+    cron. If both queries return empty, logs error and returns gracefully."""
+    headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
+    seen_ids = set()
+    all_items = []
+
+    # Query 1: topic-based — catches CDC-tagged outbreak content cleanly.
+    topic_params = {
+        "topic": "Outbreaks",
+        "sort": "-datePublished",
+        "max": str(limit),
+    }
+    for item in _cdc_fetch(topic_params, headers, "topic"):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if mid is None or mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        all_items.append(item)
+
+    # Query 2: text-based — broader catch for items not tagged with the
+    # Outbreaks topic but mentioning outbreak in name/description.
+    q_params = {
+        "q": "outbreak",
+        "sort": "-datePublished",
+        "max": str(limit),
+    }
+    for item in _cdc_fetch(q_params, headers, "q"):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if mid is None or mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        all_items.append(item)
+
+    if not all_items:
+        update_ingest_log("cdc_syn", success=False, error="no results from either query")
+        return {"source": "cdc_syn", "error": "no results from either query", "inserted": 0}
+
+    inserted = 0
+    skipped = 0
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in all_items:
+                mid = rec.get("id")
+                if mid is None:
+                    skipped = skipped + 1
+                    continue
+                oid = "cdc_syn_" + str(mid)
+
+                name = str(rec.get("name") or "").strip()
+                if not name:
+                    skipped = skipped + 1
+                    continue
+
+                description = str(rec.get("description") or "")
+
+                # Cull non-outbreak press releases caught by q=outbreak.
+                if not _is_outbreak_content(name, description):
+                    skipped = skipped + 1
+                    continue
+
+                # Date — prefer datePublished, fall back to dateContentPublished.
+                # Keep YYYY-MM-DD so the v0.1.11 year-substring filter works.
+                pub = str(rec.get("datePublished") or
+                          rec.get("dateContentPublished") or
+                          rec.get("dateContentAuthored") or "").strip()
+                report_date = pub[:10] if len(pub) >= 10 else pub
+
+                # Source URL — link to the original CDC article.
+                report_url = str(rec.get("sourceUrl") or
+                                 rec.get("targetUrl") or
+                                 "https://www.cdc.gov/outbreaks/").strip()
+
+                # Geo extraction from geoTags.
+                state, country_code, country = _cdc_extract_geo(rec)
+
+                # For US outbreaks: region = expanded state name.
+                # For international: region = country name (or empty if no geo).
+                # Search SQL matches `region ILIKE %query%` so we want a useful
+                # label here. Many CDC outbreak notices are multistate with no
+                # admin1Code — we fall back to "United States" so country-level
+                # searches catch them.
+                if state:
+                    region = state
+                    location = state
+                elif country_code == "US":
+                    region = "United States"
+                    location = "United States"
+                elif country:
+                    region = country
+                    location = country
+                else:
+                    region = ""
+                    location = ""
+
+                # Summary — strip HTML and cap length.
+                summary = _strip_html(description)[:500]
+
+                # Agent — name is the outbreak headline ("Salmonella outbreak
+                # linked to backyard poultry"). Most useful single label.
+                agent = name
+
+                try:
+                    c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
+                        country_code, region, ship_name, cruise_line, cases, report_date, report_url, summary, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (outbreak_id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            agent = EXCLUDED.agent,
+                            location = EXCLUDED.location,
+                            country_code = EXCLUDED.country_code,
+                            region = EXCLUDED.region,
+                            report_date = EXCLUDED.report_date,
+                            report_url = EXCLUDED.report_url,
+                            summary = EXCLUDED.summary,
+                            fetched_at = CURRENT_TIMESTAMP""",
+                        ("cdc_syn", oid, name, agent, location, country_code, region,
+                         None, None, None, report_date, report_url, summary,
+                         json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[cdc_syn] skip " + oid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("cdc_syn", success=True, record_count=inserted)
+        return {"source": "cdc_syn", "fetched": len(all_items), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("cdc_syn", success=False, error=str(e))
+        return {"source": "cdc_syn", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -1458,13 +1713,16 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
             outbreaks: list = []
             seen_oids = set()
 
-            # NORS branch: state-level, US-only.
+            # CDC Content Syndication branch: state-level, US-focused.
+            # Replaces the old NORS branch in v0.1.13 — CDC syn is the live
+            # alert source; NORS data (if any) is frozen historical and not
+            # queried here.
             if state:
                 like = "%" + state + "%"
                 c.execute("""SELECT id, source, outbreak_id, title, agent, location,
                     country_code, region, cases, report_date, report_url, summary, fetched_at
                     FROM oh_outbreaks
-                    WHERE source = 'cdc_nors'
+                    WHERE source = 'cdc_syn'
                       AND (region ILIKE %s OR location ILIKE %s)
                     AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
@@ -1520,7 +1778,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                 sql_fb = ("""SELECT id, source, outbreak_id, title, agent, location,
                     country_code, region, cases, report_date, report_url, summary, fetched_at
                     FROM oh_outbreaks
-                    WHERE source NOT IN ('cdc_nors', 'who_don', 'cdc_vsp')
+                    WHERE source NOT IN ('cdc_nors', 'cdc_syn', 'who_don', 'cdc_vsp')
                       AND (""" + " OR ".join(fallback_where) + """)
                     AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
@@ -1661,11 +1919,12 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
             outbreaks: list = []
             seen_oids = set()
 
-            # NORS: state-level US data
+            # CDC Content Syndication: state-level US data. Replaces the old
+            # NORS branch in v0.1.13 — CDC syn is the live alert source.
             c.execute("""SELECT id, source, outbreak_id, title, agent, location,
                 country_code, region, cases, report_date, report_url, summary, fetched_at
                 FROM oh_outbreaks
-                WHERE source = 'cdc_nors'
+                WHERE source = 'cdc_syn'
                   AND (region ILIKE %s OR location ILIKE %s)
                 AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
@@ -1701,7 +1960,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
             sql_fb = ("""SELECT id, source, outbreak_id, title, agent, location,
                 country_code, region, cases, report_date, report_url, summary, fetched_at
                 FROM oh_outbreaks
-                WHERE source NOT IN ('cdc_nors', 'who_don', 'cdc_vsp')
+                WHERE source NOT IN ('cdc_nors', 'cdc_syn', 'who_don', 'cdc_vsp')
                   AND (""" + " OR ".join(fallback_where) + """)
                 AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
@@ -1975,19 +2234,26 @@ async def admin_refresh_recalls(_admin=Depends(require_admin)):
 
 @app.post("/admin/refresh-outbreaks")
 async def admin_refresh_outbreaks(_admin=Depends(require_admin)):
-    """Manual trigger for outbreak ingests (NORS + WHO DON, VSP later).
+    """Manual trigger for outbreak ingests (WHO DON + CDC Content Syndication).
+    NORS is mothballed in v0.1.13 — the ingest_nors() function still exists
+    but is no longer called from the cron or this admin endpoint, because
+    NORS publishes 1-3 years after the event (retrospective registry) and
+    OHW is about alerts, not history. The CDC Content Syndication adapter
+    replaces it as the live US signal.
     Returns per-source result dicts."""
-    nors_res = ingest_nors()
     who_res = ingest_who_don()
-    return {"nors": nors_res, "who_don": who_res, "ran_at": datetime.utcnow().isoformat()}
+    cdc_res = ingest_cdc_outbreaks()
+    return {"who_don": who_res, "cdc_syn": cdc_res, "ran_at": datetime.utcnow().isoformat()}
 
 
 # ── CRON ──────────────────────────────────────────────────────────────────────
 def run_watchlist_check():
-    """Background tick. v0.1.3 runs openFDA drug+device recall ingest plus
-    CDC NORS foodborne/waterborne outbreaks. Future adapters (WHO DON,
-    State Dept, VSP) land progressively. Each adapter calls update_ingest_log()
-    on completion, success or failure."""
+    """Background tick. Runs openFDA drug+device recall ingest plus the
+    live outbreak adapters: WHO DON (international) and CDC Content
+    Syndication (US). NORS is mothballed in v0.1.13 — its ingest function
+    still exists but is no longer called here, because NORS publishes
+    1-3 years after the event. OHW is about alerts, not history.
+    Each adapter calls update_ingest_log() on completion, success or failure."""
     print("[cron] tick at " + datetime.utcnow().isoformat())
     try:
         drug_res = ingest_openfda_drugs()
@@ -2002,17 +2268,17 @@ def run_watchlist_check():
         print("[cron] fda_device exception: " + str(e))
         update_ingest_log("fda_device", success=False, error=str(e))
     try:
-        nors_res = ingest_nors()
-        print("[cron] cdc_nors: " + json.dumps(nors_res))
-    except Exception as e:
-        print("[cron] cdc_nors exception: " + str(e))
-        update_ingest_log("cdc_nors", success=False, error=str(e))
-    try:
         who_res = ingest_who_don()
         print("[cron] who_don: " + json.dumps(who_res))
     except Exception as e:
         print("[cron] who_don exception: " + str(e))
         update_ingest_log("who_don", success=False, error=str(e))
+    try:
+        cdc_res = ingest_cdc_outbreaks()
+        print("[cron] cdc_syn: " + json.dumps(cdc_res))
+    except Exception as e:
+        print("[cron] cdc_syn exception: " + str(e))
+        update_ingest_log("cdc_syn", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
