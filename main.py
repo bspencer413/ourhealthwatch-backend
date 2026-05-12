@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.15"
+API_VERSION = "0.1.16"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -1767,7 +1767,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source = 'cdc_syn'
                       AND (region ILIKE %s OR location ILIKE %s)
-                    AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                     (like, like))
                 for r in c.fetchall():
@@ -1793,7 +1793,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source = 'who_don'
                       AND (""" + " OR ".join(where) + """)
-                    AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
                 c.execute(sql_who, tuple(params))
                 for r in c.fetchall():
@@ -1823,7 +1823,7 @@ async def get_place_events(place_id: int, user=Depends(require_user)):
                     FROM oh_outbreaks
                     WHERE source NOT IN ('cdc_nors', 'cdc_syn', 'who_don', 'cdc_vsp')
                       AND (""" + " OR ".join(fallback_where) + """)
-                    AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                     ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
                 c.execute(sql_fb, tuple(fallback_params))
                 for r in c.fetchall():
@@ -1969,7 +1969,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source = 'cdc_syn'
                   AND (region ILIKE %s OR location ILIKE %s)
-                AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                 (like_state, like_state))
             for r in c.fetchall():
@@ -1984,7 +1984,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source = 'who_don'
                   AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
-                AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                 (like_state, state, like_state))
             for r in c.fetchall():
@@ -2005,7 +2005,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 FROM oh_outbreaks
                 WHERE source NOT IN ('cdc_nors', 'cdc_syn', 'who_don', 'cdc_vsp')
                   AND (""" + " OR ".join(fallback_where) + """)
-                AND COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')
+                AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                 ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
             c.execute(sql_fb, tuple(fallback_params))
             for r in c.fetchall():
@@ -2144,7 +2144,7 @@ async def recent_outbreaks(
         with get_db() as conn:
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             where = [
-                "COALESCE(SUBSTRING(report_date FROM 1 FOR 4), '0000') >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY')"
+                "report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')"
             ]
             params: list = []
             if source:
