@@ -17,6 +17,8 @@ import requests
 import urllib.request
 import urllib.parse
 import urllib.error
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 from typing import Optional, List
 
@@ -38,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.22"
+API_VERSION = "0.1.24"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -67,6 +69,10 @@ CDC_SYN_FETCH_LIMIT = 50
 # Distinct ingest function for clarity + independent error handling.
 CDC_HAN_MEDIA_ID = 413690
 CDC_HAN_FETCH_LIMIT = 50
+# v0.1.24: HAN syndication's JSON listing path doesn't surface advisories
+# via parentid (param isn't documented; we guessed). RSS endpoint is the
+# verified source. Parsed with stdlib xml.etree.
+CDC_HAN_RSS_URL = "https://tools.cdc.gov/api/v2/resources/media/413690.rss"
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -1161,71 +1167,98 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
 # distinguishes the upstream origin in raw data for future analytics without
 # affecting any user-facing path.
 
-def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
-    """Pull CDC Health Alert Network advisories via the Content Syndication
-    API. HAN feed lives at media id 413690; child advisories are fetched via
-    parentid filter, sorted newest-first. Falls back to a text-search query
-    if the parentid path returns nothing (defensive — the API parameter
-    documentation says parentid is supported but real-world behavior on
-    feed pages varies).
+def _parse_rfc822_to_iso_date(s: str) -> str:
+    """Convert RSS pubDate (RFC 822 like 'Mon, 12 May 2025 14:30:00 GMT')
+    to ISO YYYY-MM-DD. Returns '' on failure so callers can decide what
+    to do with undated rows (current rule: keep, since HAN guarantees
+    recency and a missing date shouldn't drop a real alert)."""
+    if not s:
+        return ""
+    try:
+        dt = parsedate_to_datetime(s.strip())
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
 
-    Stored as source='cdc_syn' so the existing "CDC · US" tab, search SQL,
-    and drawer matching pick HAN up with zero new wiring. 180-day cutoff
-    via contentPublishedSinceDate (matches cdc_syn freshness rule).
+
+def _fetch_han_rss(headers: dict) -> list:
+    """Fetch the HAN RSS feed and parse to a list of normalized dicts
+    shaped like CDC syndication JSON records, so the existing upsert
+    code path doesn't care which fetch strategy produced the items.
+
+    Returns [] on any network/parse failure (logged); the caller
+    decides how to handle empty results."""
+    try:
+        r = requests.get(CDC_HAN_RSS_URL, headers=headers, timeout=30)
+        if r.status_code != 200:
+            print("[cdc_han] RSS HTTP " + str(r.status_code) + ": " + r.text[:200])
+            return []
+    except Exception as e:
+        print("[cdc_han] RSS request failed: " + str(e))
+        return []
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as e:
+        print("[cdc_han] RSS parse failed: " + str(e))
+        return []
+    channel = root.find("channel")
+    if channel is None:
+        # Some feeds wrap items differently (Atom); try direct.
+        items_root = root
+    else:
+        items_root = channel
+    items = []
+    for it in items_root.findall("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        pub = (it.findtext("pubDate") or "").strip()
+        desc = (it.findtext("description") or "").strip()
+        guid = (it.findtext("guid") or "").strip()
+        # Prefer guid (stable), fall back to link if guid absent.
+        uid = guid or link
+        if not uid or not title:
+            continue
+        # Normalize to the shape ingest_cdc_han expects (CDC syndication
+        # JSON record keys: id, name, sourceUrl, datePublished, description,
+        # geoTags). RSS has no structured geo, so geoTags is empty —
+        # _cdc_extract_geo() returns ('', '', '') and the adapter's
+        # "no geo at all" branch kicks in, defaulting to US/nationwide.
+        items.append({
+            "id": uid,
+            "name": title,
+            "sourceUrl": link or "https://emergency.cdc.gov/han/",
+            "datePublished": _parse_rfc822_to_iso_date(pub),
+            "description": desc,
+            "geoTags": [],
+        })
+    return items
+
+
+def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
+    """Pull CDC Health Alert Network advisories via the official RSS feed
+    (media id 413690). HAN is CDC's most "alerty" channel — urgent vetted
+    public health incidents only.
+
+    v0.1.24: switched from JSON listing (parentid/q queries returned zero
+    in v0.1.22) to the verified RSS endpoint. Records are normalized into
+    the same dict shape the original loop expected, so the rest of the
+    function (filter, upsert, geo fallback) is unchanged.
+
+    Stored as source='cdc_syn' so the existing "CDC . US" tab, search
+    SQL, and drawer matching pick HAN up with zero new wiring.
 
     Resilient: skips parse failures, never crashes the cron."""
     headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
-    seen_ids = set()
-    all_items = []
 
     cutoff_dt = datetime.utcnow() - timedelta(days=180)
-    cutoff_iso = cutoff_dt.strftime("%Y-%m-%d")
 
-    # Query 1: children of HAN feed (parentid=413690). Cleanest — pulls
-    # only HAN advisories, no noise.
-    parent_params = {
-        "parentid": str(CDC_HAN_MEDIA_ID),
-        "sort": "-datePublished",
-        "max": str(limit),
-        "contentPublishedSinceDate": cutoff_iso,
-    }
-    for item in _cdc_fetch(parent_params, headers, "han_parent"):
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("id")
-        if mid is None or mid in seen_ids:
-            continue
-        seen_ids.add(mid)
-        all_items.append(item)
-
-    # Query 2: text fallback — catches any HAN advisory not surfaced by
-    # parentid filter, plus historical CDCHAN-tagged content that lives
-    # outside the feed page hierarchy.
-    q_params = {
-        "q": "HAN health alert network",
-        "sort": "-datePublished",
-        "max": str(limit),
-        "contentPublishedSinceDate": cutoff_iso,
-    }
-    for item in _cdc_fetch(q_params, headers, "han_q"):
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("id")
-        if mid is None or mid in seen_ids:
-            continue
-        # Only include if title/desc actually references HAN — q matches
-        # broadly and could surface unrelated press releases.
-        nm = str(item.get("name") or "")
-        ds = str(item.get("description") or "")
-        blob = (nm + " " + ds).lower()
-        if "han" not in blob and "health alert network" not in blob:
-            continue
-        seen_ids.add(mid)
-        all_items.append(item)
-
+    all_items = _fetch_han_rss(headers)
     if not all_items:
-        update_ingest_log("cdc_han", success=False, error="no results from either query")
-        return {"source": "cdc_han", "error": "no results from either query", "inserted": 0}
+        update_ingest_log("cdc_han", success=False, error="RSS returned no items")
+        return {"source": "cdc_han", "error": "RSS returned no items", "inserted": 0}
+
+    # Cap to limit (RSS feed typically returns latest 20-50 anyway).
+    all_items = all_items[:limit]
 
     inserted = 0
     skipped = 0
@@ -1237,10 +1270,8 @@ def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
                 if mid is None:
                     skipped = skipped + 1
                     continue
-                # Stored as cdc_syn source but with 'cdc_han_' prefix in the
-                # outbreak_id so upstream lineage is preserved (and ON CONFLICT
-                # doesn't collide with regular cdc_syn rows even if media ids
-                # were to overlap, which they shouldn't).
+                # 'cdc_han_' prefix preserves upstream lineage in raw data
+                # while source='cdc_syn' merges into the unified CDC bucket.
                 oid = "cdc_han_" + str(mid)
 
                 raw_name = str(rec.get("name") or "").strip()
@@ -1254,11 +1285,8 @@ def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
                 # No pathogen-term filter for HAN — curated by CDC as urgent
                 # already. Ingest all.
 
-                # Date
-                pub = str(rec.get("datePublished") or
-                          rec.get("dateContentPublished") or
-                          rec.get("dateContentAuthored") or "").strip()
-                report_date = pub[:10] if len(pub) >= 10 else pub
+                # Date — RSS already normalized to YYYY-MM-DD by _fetch_han_rss.
+                report_date = str(rec.get("datePublished") or "").strip()
 
                 # Client-side 180-day cutoff defense.
                 if report_date and len(report_date) >= 10:
@@ -1272,11 +1300,10 @@ def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
 
                 # Source URL — HAN advisories live at emergency.cdc.gov/han/
                 report_url = str(rec.get("sourceUrl") or
-                                 rec.get("targetUrl") or
                                  "https://emergency.cdc.gov/han/").strip()
 
-                # Geo from geoTags. HAN alerts are often nationwide; fall back
-                # to "United States" so country-level matching catches them.
+                # Geo from geoTags (empty for RSS-sourced rows). Default to
+                # nationwide US since HAN is a US alert network.
                 state, country_code, country = _cdc_extract_geo(rec)
                 if state:
                     region = state
@@ -1288,9 +1315,6 @@ def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
                     region = country
                     location = country
                 else:
-                    # No geo at all — default to US since HAN is a US alert
-                    # network. Lets US-state and "North America" region
-                    # searches surface these.
                     region = "United States"
                     location = "United States"
                     country_code = "US"
