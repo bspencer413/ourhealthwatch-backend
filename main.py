@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import psycopg2
 import psycopg2.extras
 import os
+import re
 import json
 import bcrypt
 import jwt
@@ -36,7 +37,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.11"
+API_VERSION = "0.1.12"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -45,6 +46,10 @@ OPENFDA_DRUG_URL = "https://api.fda.gov/drug/enforcement.json"
 OPENFDA_DEVICE_URL = "https://api.fda.gov/device/enforcement.json"
 NORS_URL = "https://data.cdc.gov/resource/5xkq-dg7x.json"  # CDC NORS foodborne/waterborne outbreaks
 NORS_FETCH_LIMIT = 200
+# WHO Disease Outbreak News — canonical international outbreak record, published
+# near-real-time. Provides JSON via the WHO REST API (OData v4 style).
+WHO_DON_URL = "https://www.who.int/api/news/diseaseoutbreaknews"
+WHO_DON_FETCH_LIMIT = 50
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -502,6 +507,197 @@ def ingest_nors(limit: int = NORS_FETCH_LIMIT) -> dict:
     except Exception as e:
         update_ingest_log("cdc_nors", success=False, error=str(e))
         return {"source": "cdc_nors", "error": str(e), "inserted": inserted}
+
+
+# ── INGEST: WHO DISEASE OUTBREAK NEWS ─────────────────────────────────────────
+# Canonical international outbreak record. Unlike NORS (which trails reality by
+# 1–3 years), WHO DON publishes within days of an outbreak announcement.
+# Schema reference: https://www.who.int/api/news/diseaseoutbreaknews/sfhelp
+# Fields used: DonId, Title, OverrideTitle, UseOverrideTitle, PublicationDateAndTime,
+# PublicationDate, UrlName, Overview, Summary. The `regionscountries` field is a
+# UUID reference to a related entity — we parse the country from the title
+# instead, which is reliable for ~99% of DON reports.
+
+# UN member states + a few common short forms WHO uses in DON titles. Order
+# matters for substring matching: longer multi-word names BEFORE their shorter
+# components (so "Democratic Republic of the Congo" wins over "Congo").
+WHO_DON_COUNTRIES = [
+    "Democratic Republic of the Congo", "United Arab Emirates", "United Kingdom",
+    "United States of America", "United States", "Saint Vincent and the Grenadines",
+    "Saint Kitts and Nevis", "Sao Tome and Principe", "Bosnia and Herzegovina",
+    "Trinidad and Tobago", "Antigua and Barbuda", "Central African Republic",
+    "Papua New Guinea", "Marshall Islands", "Solomon Islands", "North Macedonia",
+    "North Korea", "South Korea", "South Sudan", "South Africa", "Saudi Arabia",
+    "Sri Lanka", "Sierra Leone", "Equatorial Guinea", "Guinea-Bissau", "Costa Rica",
+    "Cote d'Ivoire", "El Salvador", "Dominican Republic", "Burkina Faso",
+    "New Zealand", "Cabo Verde", "Czech Republic", "Timor-Leste", "Cook Islands",
+    "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Argentina",
+    "Armenia", "Australia", "Austria", "Azerbaijan", "Bahamas", "Bahrain",
+    "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan",
+    "Bolivia", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burundi", "Cambodia",
+    "Cameroon", "Canada", "Chad", "Chile", "China", "Colombia", "Comoros",
+    "Croatia", "Cuba", "Cyprus", "Denmark", "Djibouti", "Dominica", "Ecuador",
+    "Egypt", "Eritrea", "Estonia", "Eswatini", "Ethiopia", "Fiji", "Finland",
+    "France", "Gabon", "Gambia", "Georgia", "Germany", "Ghana", "Greece",
+    "Grenada", "Guatemala", "Guinea", "Guyana", "Haiti", "Honduras", "Hungary",
+    "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Israel",
+    "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati",
+    "Kuwait", "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia",
+    "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Madagascar", "Malawi",
+    "Malaysia", "Maldives", "Mali", "Malta", "Mauritania", "Mauritius", "Mexico",
+    "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco",
+    "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal", "Netherlands",
+    "Nicaragua", "Niger", "Nigeria", "Norway", "Oman", "Pakistan", "Palau",
+    "Palestine", "Panama", "Paraguay", "Peru", "Philippines", "Poland",
+    "Portugal", "Qatar", "Romania", "Russia", "Rwanda", "Saint Lucia", "Samoa",
+    "San Marino", "Senegal", "Serbia", "Seychelles", "Singapore", "Slovakia",
+    "Slovenia", "Somalia", "Spain", "Sudan", "Suriname", "Sweden", "Switzerland",
+    "Syria", "Taiwan", "Tajikistan", "Tanzania", "Thailand", "Togo", "Tonga",
+    "Tunisia", "Turkey", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine",
+    "Uruguay", "Uzbekistan", "Vanuatu", "Venezuela", "Vietnam", "Yemen",
+    "Zambia", "Zimbabwe", "Congo",
+]
+# Pre-lowercased pairs for fast matching while preserving display form.
+_WHO_DON_COUNTRIES_LC = [(c.lower(), c) for c in WHO_DON_COUNTRIES]
+
+
+def _extract_country_from_title(title: str) -> str:
+    """Find the first known country name appearing as a whole word in the title.
+    Returns the canonical display form or '' if none matched. Order of
+    WHO_DON_COUNTRIES ensures multi-word names win over their components."""
+    if not title:
+        return ""
+    t = title.lower()
+    for needle, display in _WHO_DON_COUNTRIES_LC:
+        i = t.find(needle)
+        if i < 0:
+            continue
+        before_ok = (i == 0) or not t[i - 1].isalpha()
+        end = i + len(needle)
+        after_ok = (end == len(t)) or not t[end].isalpha()
+        if before_ok and after_ok:
+            return display
+    return ""
+
+
+def _strip_html(text: str) -> str:
+    """Quick-and-dirty HTML tag removal for the WHO Overview field (which
+    arrives as HTML markup). Collapses whitespace too."""
+    if not text:
+        return ""
+    out = re.sub(r"<[^>]+>", " ", text)
+    out = re.sub(r"\s+", " ", out)
+    return out.strip()
+
+
+def ingest_who_don(limit: int = WHO_DON_FETCH_LIMIT) -> dict:
+    """Pull recent WHO Disease Outbreak News reports via the WHO REST API.
+    Upserts into oh_outbreaks with source='who_don'. Country is parsed from
+    the report title. Updates oh_ingest_log on every run, success or failure.
+    Resilient to schema surprises — any record that fails to parse is skipped
+    rather than crashing the cron."""
+    params = {
+        "$top": str(limit),
+        "$orderby": "PublicationDateAndTime desc",
+    }
+    headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
+    inserted = 0
+    skipped = 0
+    try:
+        r = requests.get(WHO_DON_URL, params=params, headers=headers, timeout=30)
+        if r.status_code != 200:
+            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            update_ingest_log("who_don", success=False, error=err)
+            return {"source": "who_don", "error": err, "inserted": 0}
+        try:
+            data = r.json()
+        except Exception as je:
+            err = "JSON parse failed: " + str(je) + " body[:200]=" + r.text[:200]
+            update_ingest_log("who_don", success=False, error=err)
+            return {"source": "who_don", "error": err, "inserted": 0}
+        # OData v4 wraps the array in `value`. Fall back to a top-level array
+        # in case the endpoint changes shape.
+        if isinstance(data, dict):
+            items = data.get("value")
+            if not isinstance(items, list):
+                items = []
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in items:
+                if not isinstance(rec, dict):
+                    skipped = skipped + 1
+                    continue
+                don_id = (rec.get("DonId") or "").strip() if isinstance(rec.get("DonId"), str) else str(rec.get("DonId") or "")
+                if not don_id:
+                    skipped = skipped + 1
+                    continue
+                oid = "who_don_" + don_id[:120]
+
+                # Title — prefer OverrideTitle only when explicitly flagged.
+                title = ""
+                if rec.get("UseOverrideTitle") and rec.get("OverrideTitle"):
+                    title = str(rec.get("OverrideTitle") or "").strip()
+                if not title:
+                    title = str(rec.get("Title") or "").strip()
+                if not title:
+                    skipped = skipped + 1
+                    continue
+
+                # Country extraction from title.
+                country = _extract_country_from_title(title)
+
+                # Date — keep YYYY-MM-DD so the v0.1.11 year-substring filter
+                # still works (SUBSTRING(report_date FROM 1 FOR 4)).
+                pub = str(rec.get("PublicationDateAndTime") or
+                          rec.get("PublicationDate") or "").strip()
+                report_date = pub[:10] if len(pub) >= 10 else pub
+
+                # Article URL
+                url_name = str(rec.get("UrlName") or "").strip()
+                if url_name:
+                    report_url = "https://www.who.int/emergencies/disease-outbreak-news/item/" + url_name
+                else:
+                    report_url = "https://www.who.int/emergencies/disease-outbreak-news"
+
+                # Summary — Overview is the human-readable lede; strip HTML.
+                overview_html = str(rec.get("Overview") or rec.get("Summary") or "").strip()
+                summary = _strip_html(overview_html)[:500]
+
+                # Agent — WHO DON titles already carry the pathogen prominently
+                # (e.g. "Cholera - Yemen"). For v1 we use the title verbatim;
+                # a later pass can split on dashes for cleaner separation.
+                agent = title
+
+                try:
+                    c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
+                        country_code, region, ship_name, cruise_line, cases, report_date, report_url, summary, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (outbreak_id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            agent = EXCLUDED.agent,
+                            location = EXCLUDED.location,
+                            region = EXCLUDED.region,
+                            report_date = EXCLUDED.report_date,
+                            report_url = EXCLUDED.report_url,
+                            summary = EXCLUDED.summary,
+                            fetched_at = CURRENT_TIMESTAMP""",
+                        ("who_don", oid, title, agent, country, "", country,
+                         None, None, None, report_date, report_url, summary,
+                         json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[who_don] skip " + oid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("who_don", success=True, record_count=inserted)
+        return {"source": "who_don", "fetched": len(items), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("who_don", success=False, error=str(e))
+        return {"source": "who_don", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -1779,10 +1975,11 @@ async def admin_refresh_recalls(_admin=Depends(require_admin)):
 
 @app.post("/admin/refresh-outbreaks")
 async def admin_refresh_outbreaks(_admin=Depends(require_admin)):
-    """Manual trigger for outbreak ingests (NORS + future WHO DON, VSP).
+    """Manual trigger for outbreak ingests (NORS + WHO DON, VSP later).
     Returns per-source result dicts."""
     nors_res = ingest_nors()
-    return {"nors": nors_res, "ran_at": datetime.utcnow().isoformat()}
+    who_res = ingest_who_don()
+    return {"nors": nors_res, "who_don": who_res, "ran_at": datetime.utcnow().isoformat()}
 
 
 # ── CRON ──────────────────────────────────────────────────────────────────────
@@ -1810,6 +2007,12 @@ def run_watchlist_check():
     except Exception as e:
         print("[cron] cdc_nors exception: " + str(e))
         update_ingest_log("cdc_nors", success=False, error=str(e))
+    try:
+        who_res = ingest_who_don()
+        print("[cron] who_don: " + json.dumps(who_res))
+    except Exception as e:
+        print("[cron] who_don exception: " + str(e))
+        update_ingest_log("who_don", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
