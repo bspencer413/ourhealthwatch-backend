@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.24"
+API_VERSION = "0.1.25"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -61,18 +61,19 @@ WHO_DON_FETCH_LIMIT = 50
 # matching is structured — no title parsing needed.
 CDC_SYN_URL = "https://tools.cdc.gov/api/v2/resources/media"
 CDC_SYN_FETCH_LIMIT = 50
-# v0.1.22: CDC Health Alert Network feed (media id 413690). HAN is CDC's
-# primary channel for urgent public health incidents — much more "alerty"
-# than the Newsroom outbreak notices we ingest as cdc_syn. Per Bill's call,
-# HAN merges INTO source='cdc_syn' so the existing search, drawer, and
-# firehose "CDC · US" tab pick up HAN advisories with zero new wiring.
-# Distinct ingest function for clarity + independent error handling.
-CDC_HAN_MEDIA_ID = 413690
-CDC_HAN_FETCH_LIMIT = 50
-# v0.1.24: HAN syndication's JSON listing path doesn't surface advisories
-# via parentid (param isn't documented; we guessed). RSS endpoint is the
-# verified source. Parsed with stdlib xml.etree.
-CDC_HAN_RSS_URL = "https://tools.cdc.gov/api/v2/resources/media/413690.rss"
+# v0.1.25: EPA ECHO Enforcement Case Search. Civil + criminal enforcement
+# actions taken by EPA against regulated facilities — the alert moment for
+# environmental incidents (chemical/water/air violations escalated to formal
+# action). No API key, JSON output. Replaces dead cdc_han (HAN RSS feed
+# abandoned by HHS since 2025-03-31; OHW strategic pivot: don't build on
+# thinning HHS sources, expand to environmental/policy verticals).
+#
+# Storage: source='epa_enforce' in oh_outbreaks (case shape maps cleanly to
+# the OutbreakCard renderer — title=case name, location=state, summary=
+# statutes+penalty). Outbreak_id prefix 'epa_enforce_' preserves lineage.
+EPA_ENFORCE_URL = "https://ofmpub.epa.gov/echo/case_rest_services.get_cases"
+EPA_ENFORCE_FETCH_LIMIT = 100
+EPA_ENFORCE_WINDOW_DAYS = 90
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -1154,173 +1155,143 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
         return {"source": "cdc_syn", "error": str(e), "inserted": inserted}
 
 
-# ── INGEST: CDC HEALTH ALERT NETWORK (urgent US health incidents) ────────────
-# HAN is CDC's primary channel for urgent public health alerts — the most
-# time-sensitive content CDC publishes. Examples include outbreak alerts,
-# clinical advisories, drug shortages, environmental health warnings. All
-# vetted as urgent enough to merit a CDC alert; we ingest ALL HAN content
-# (no pathogen-term filter like cdc_syn uses) because the curation already
-# happened upstream.
+# ── INGEST: EPA ECHO ENFORCEMENT CASE SEARCH (env enforcement actions) ───────
+# v0.1.25 strategic pivot: HHS feeds thinning, OHW expanding to environmental
+# and policy verticals. EPA ECHO (Enforcement and Compliance History Online)
+# Enforcement Case Search returns civil + criminal enforcement actions taken
+# by EPA against regulated facilities — the alert moment for environmental
+# incidents that have escalated to formal action.
 #
-# Storage: source='cdc_syn' to MERGE with existing CDC syndication content
-# under one "CDC · US" bucket in the firehose. Outbreak_id prefix 'cdc_han_'
-# distinguishes the upstream origin in raw data for future analytics without
-# affecting any user-facing path.
+# Data shape maps cleanly onto oh_outbreaks: case name → title, defendant +
+# violation_type → agent, facility state → region/location, settlement_date
+# → report_date, statutes + penalty → summary. OutbreakCard renders without
+# modification.
+#
+# Endpoint: ofmpub.epa.gov (long-running EPA application server, live since
+# at least 2014). Modern alias is echodata.epa.gov; both currently work.
+# No API key required. JSON output. Rate-limited but generous; we cap at
+# EPA_ENFORCE_FETCH_LIMIT per run and rely on the cron cadence.
+#
+# Resilience: ECHO's response schema has shifted historically. Adapter
+# uses multiple fallback field names for each value (CaseName/Defendant,
+# SettlementDate/CaseFiledDate, etc.). Unknown fields skip gracefully.
 
-def _parse_rfc822_to_iso_date(s: str) -> str:
-    """Convert RSS pubDate (RFC 822 like 'Mon, 12 May 2025 14:30:00 GMT')
-    to ISO YYYY-MM-DD. Returns '' on failure so callers can decide what
-    to do with undated rows (current rule: keep, since HAN guarantees
-    recency and a missing date shouldn't drop a real alert)."""
-    if not s:
-        return ""
-    try:
-        dt = parsedate_to_datetime(s.strip())
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return ""
-
-
-def _fetch_han_rss(headers: dict) -> list:
-    """Fetch the HAN RSS feed and parse to a list of normalized dicts
-    shaped like CDC syndication JSON records, so the existing upsert
-    code path doesn't care which fetch strategy produced the items.
-
-    Returns [] on any network/parse failure (logged); the caller
-    decides how to handle empty results."""
-    try:
-        r = requests.get(CDC_HAN_RSS_URL, headers=headers, timeout=30)
-        if r.status_code != 200:
-            print("[cdc_han] RSS HTTP " + str(r.status_code) + ": " + r.text[:200])
-            return []
-    except Exception as e:
-        print("[cdc_han] RSS request failed: " + str(e))
-        return []
-    try:
-        root = ET.fromstring(r.text)
-    except ET.ParseError as e:
-        print("[cdc_han] RSS parse failed: " + str(e))
-        return []
-    channel = root.find("channel")
-    if channel is None:
-        # Some feeds wrap items differently (Atom); try direct.
-        items_root = root
-    else:
-        items_root = channel
-    items = []
-    for it in items_root.findall("item"):
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        pub = (it.findtext("pubDate") or "").strip()
-        desc = (it.findtext("description") or "").strip()
-        guid = (it.findtext("guid") or "").strip()
-        # Prefer guid (stable), fall back to link if guid absent.
-        uid = guid or link
-        if not uid or not title:
-            continue
-        # Normalize to the shape ingest_cdc_han expects (CDC syndication
-        # JSON record keys: id, name, sourceUrl, datePublished, description,
-        # geoTags). RSS has no structured geo, so geoTags is empty —
-        # _cdc_extract_geo() returns ('', '', '') and the adapter's
-        # "no geo at all" branch kicks in, defaulting to US/nationwide.
-        items.append({
-            "id": uid,
-            "name": title,
-            "sourceUrl": link or "https://emergency.cdc.gov/han/",
-            "datePublished": _parse_rfc822_to_iso_date(pub),
-            "description": desc,
-            "geoTags": [],
-        })
-    return items
-
-
-def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
-    """Pull CDC Health Alert Network advisories via the official RSS feed
-    (media id 413690). HAN is CDC's most "alerty" channel — urgent vetted
-    public health incidents only.
-
-    v0.1.24: switched from JSON listing (parentid/q queries returned zero
-    in v0.1.22) to the verified RSS endpoint. Records are normalized into
-    the same dict shape the original loop expected, so the rest of the
-    function (filter, upsert, geo fallback) is unchanged.
-
-    Stored as source='cdc_syn' so the existing "CDC . US" tab, search
-    SQL, and drawer matching pick HAN up with zero new wiring.
-
-    Resilient: skips parse failures, never crashes the cron."""
+def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
+                       window_days: int = EPA_ENFORCE_WINDOW_DAYS) -> dict:
+    """Pull recent EPA enforcement cases (civil + criminal) from ECHO.
+    Upserts into oh_outbreaks with source='epa_enforce'. Each case becomes
+    an "outbreak"-shaped row so the existing OutbreakCard + drawer + search
+    paths render it without changes. Updates oh_ingest_log on every run,
+    success or failure."""
     headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
-
-    cutoff_dt = datetime.utcnow() - timedelta(days=180)
-
-    all_items = _fetch_han_rss(headers)
-    if not all_items:
-        update_ingest_log("cdc_han", success=False, error="RSS returned no items")
-        return {"source": "cdc_han", "error": "RSS returned no items", "inserted": 0}
-
-    # Cap to limit (RSS feed typically returns latest 20-50 anyway).
-    all_items = all_items[:limit]
-
+    cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y-%m-%d")
+    params = {
+        "output": "JSON",
+        "responseset": str(limit),
+        # Settlement date lower bound. ECHO uses p_sl_dfr_from / p_sl_dto_to
+        # for settlement date range; p_act_dfrom / p_act_dto for activity
+        # date. We send settlement-date-from as the recency filter.
+        "p_sl_dfr_from": cutoff,
+    }
     inserted = 0
     skipped = 0
     try:
+        r = requests.get(EPA_ENFORCE_URL, params=params, headers=headers, timeout=45)
+        if r.status_code != 200:
+            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            update_ingest_log("epa_enforce", success=False, error=err)
+            return {"source": "epa_enforce", "error": err, "inserted": 0}
+        try:
+            data = r.json()
+        except Exception as je:
+            err = "JSON parse failed: " + str(je) + " body[:200]=" + r.text[:200]
+            update_ingest_log("epa_enforce", success=False, error=err)
+            return {"source": "epa_enforce", "error": err, "inserted": 0}
+
+        # ECHO wraps results under a Results object; case list lives under
+        # several possible keys depending on service version. Try each.
+        items = []
+        if isinstance(data, dict):
+            results = data.get("Results") or data.get("results") or {}
+            if isinstance(results, dict):
+                cases = (results.get("Cases") or results.get("cases") or
+                         results.get("Case") or results.get("CaseList") or [])
+                if isinstance(cases, list):
+                    items = cases
+                elif isinstance(cases, dict):
+                    items = [cases]
+            elif isinstance(results, list):
+                items = results
+
         with get_db() as conn:
             c = conn.cursor()
-            for rec in all_items:
-                mid = rec.get("id")
-                if mid is None:
-                    skipped = skipped + 1
-                    continue
-                # 'cdc_han_' prefix preserves upstream lineage in raw data
-                # while source='cdc_syn' merges into the unified CDC bucket.
-                oid = "cdc_han_" + str(mid)
-
-                raw_name = str(rec.get("name") or "").strip()
-                name = _strip_html(raw_name).strip()
-                if not name:
+            for rec in items:
+                if not isinstance(rec, dict):
                     skipped = skipped + 1
                     continue
 
-                description = str(rec.get("description") or "")
+                # Case ID — primary key into ECHO. Multiple variants seen.
+                case_id = str(rec.get("CaseNumber") or rec.get("CaseId") or
+                              rec.get("ICISCaseNumber") or "").strip()
+                if not case_id:
+                    skipped = skipped + 1
+                    continue
+                oid = "epa_enforce_" + case_id[:120]
 
-                # No pathogen-term filter for HAN — curated by CDC as urgent
-                # already. Ingest all.
+                # Title — case name preferred, fall back to defendant.
+                title = str(rec.get("CaseName") or rec.get("Defendant") or
+                            rec.get("DefendantEntity") or "").strip()
+                if not title:
+                    title = "EPA Enforcement Case " + case_id
 
-                # Date — RSS already normalized to YYYY-MM-DD by _fetch_han_rss.
-                report_date = str(rec.get("datePublished") or "").strip()
-
-                # Client-side 180-day cutoff defense.
-                if report_date and len(report_date) >= 10:
-                    try:
-                        rec_dt = datetime.strptime(report_date[:10], "%Y-%m-%d")
-                        if rec_dt < cutoff_dt:
-                            skipped = skipped + 1
-                            continue
-                    except Exception:
-                        pass
-
-                # Source URL — HAN advisories live at emergency.cdc.gov/han/
-                report_url = str(rec.get("sourceUrl") or
-                                 "https://emergency.cdc.gov/han/").strip()
-
-                # Geo from geoTags (empty for RSS-sourced rows). Default to
-                # nationwide US since HAN is a US alert network.
-                state, country_code, country = _cdc_extract_geo(rec)
-                if state:
-                    region = state
-                    location = state
-                elif country_code == "US":
-                    region = "United States"
-                    location = "United States"
-                elif country:
-                    region = country
-                    location = country
+                # Location — facility city + state.
+                state_name = str(rec.get("FacilityState") or rec.get("State") or
+                                 rec.get("DefendantState") or "").strip()
+                city_name = str(rec.get("FacilityCity") or rec.get("City") or
+                                rec.get("DefendantCity") or "").strip()
+                if city_name and state_name:
+                    location = city_name + ", " + state_name
+                elif state_name:
+                    location = state_name
+                elif city_name:
+                    location = city_name
                 else:
-                    region = "United States"
-                    location = "United States"
-                    country_code = "US"
+                    location = ""
 
-                summary = _strip_html(description)[:500]
-                agent = name
+                # ECHO is US-only.
+                country_code = "US"
+
+                # Date — settlement preferred, fall back to filed date.
+                date_raw = str(rec.get("SettlementDate") or
+                               rec.get("CaseFiledDate") or
+                               rec.get("FiledDate") or
+                               rec.get("ActivityDate") or "").strip()
+                report_date = date_raw[:10] if len(date_raw) >= 10 else date_raw
+
+                # Source URL — ECHO case report deep link.
+                report_url = "https://echo.epa.gov/enforcement-case-report?id=" + case_id
+
+                # Summary — combine statutes + violation type + penalty.
+                statutes = str(rec.get("Statutes") or rec.get("PrimaryLaw") or
+                               rec.get("StatuteCode") or "").strip()
+                violation_type = str(rec.get("ViolationType") or
+                                     rec.get("CaseType") or
+                                     rec.get("EnforcementActionType") or "").strip()
+                penalty = str(rec.get("FederalPenaltyAssessedAmount") or
+                              rec.get("PenaltyAmount") or
+                              rec.get("TotalPenaltyAssessedAmount") or "").strip()
+                summary_parts = []
+                if violation_type:
+                    summary_parts.append(violation_type)
+                if statutes:
+                    summary_parts.append("Statute: " + statutes)
+                if penalty:
+                    summary_parts.append("Penalty: $" + penalty)
+                summary = " - ".join(summary_parts)[:500]
+
+                # Agent — what kind of violation (renders as the green pill
+                # on the OutbreakCard, same slot as pathogen for outbreaks).
+                agent = violation_type or statutes or "Enforcement action"
 
                 try:
                     c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
@@ -1336,19 +1307,19 @@ def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
                             report_url = EXCLUDED.report_url,
                             summary = EXCLUDED.summary,
                             fetched_at = CURRENT_TIMESTAMP""",
-                        ("cdc_syn", oid, name, agent, location, country_code, region,
+                        ("epa_enforce", oid, title, agent, location, country_code, state_name,
                          None, None, None, report_date, report_url, summary,
                          json.dumps(rec)))
                     inserted = inserted + 1
                 except Exception as e:
                     skipped = skipped + 1
-                    print("[cdc_han] skip " + oid + ": " + str(e))
+                    print("[epa_enforce] skip " + oid + ": " + str(e))
             conn.commit()
-        update_ingest_log("cdc_han", success=True, record_count=inserted)
-        return {"source": "cdc_han", "fetched": len(all_items), "inserted": inserted, "skipped": skipped}
+        update_ingest_log("epa_enforce", success=True, record_count=inserted)
+        return {"source": "epa_enforce", "fetched": len(items), "inserted": inserted, "skipped": skipped}
     except Exception as e:
-        update_ingest_log("cdc_han", success=False, error=str(e))
-        return {"source": "cdc_han", "error": str(e), "inserted": inserted}
+        update_ingest_log("epa_enforce", success=False, error=str(e))
+        return {"source": "epa_enforce", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -2767,8 +2738,8 @@ async def admin_refresh_outbreaks(_admin=Depends(require_admin)):
     Returns per-source result dicts."""
     who_res = ingest_who_don()
     cdc_res = ingest_cdc_outbreaks()
-    han_res = ingest_cdc_han()
-    return {"who_don": who_res, "cdc_syn": cdc_res, "cdc_han": han_res, "ran_at": datetime.utcnow().isoformat()}
+    epa_res = ingest_epa_enforce()
+    return {"who_don": who_res, "cdc_syn": cdc_res, "epa_enforce": epa_res, "ran_at": datetime.utcnow().isoformat()}
 
 
 # ── CRON ──────────────────────────────────────────────────────────────────────
@@ -2805,11 +2776,11 @@ def run_watchlist_check():
         print("[cron] cdc_syn exception: " + str(e))
         update_ingest_log("cdc_syn", success=False, error=str(e))
     try:
-        han_res = ingest_cdc_han()
-        print("[cron] cdc_han: " + json.dumps(han_res))
+        epa_res = ingest_epa_enforce()
+        print("[cron] epa_enforce: " + json.dumps(epa_res))
     except Exception as e:
-        print("[cron] cdc_han exception: " + str(e))
-        update_ingest_log("cdc_han", success=False, error=str(e))
+        print("[cron] epa_enforce exception: " + str(e))
+        update_ingest_log("epa_enforce", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
