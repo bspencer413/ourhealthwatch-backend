@@ -7,6 +7,7 @@ import psycopg2.extras
 import os
 import re
 import json
+import html as html_mod
 import bcrypt
 import jwt
 import threading
@@ -37,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.13"
+API_VERSION = "0.1.14"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -589,11 +590,14 @@ def _extract_country_from_title(title: str) -> str:
 
 
 def _strip_html(text: str) -> str:
-    """Quick-and-dirty HTML tag removal for the WHO Overview field (which
-    arrives as HTML markup). Collapses whitespace too."""
+    """Quick-and-dirty HTML cleanup: strip tags, decode entities (&amp; -> &,
+    &#39; -> ', etc.), collapse whitespace. Used by WHO DON Overview field
+    (HTML markup) and CDC syndication name/description fields (may contain
+    <em> emphasis tags and entity-encoded characters)."""
     if not text:
         return ""
     out = re.sub(r"<[^>]+>", " ", text)
+    out = html_mod.unescape(out)
     out = re.sub(r"\s+", " ", out)
     return out.strip()
 
@@ -826,11 +830,21 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
     seen_ids = set()
     all_items = []
 
+    # Server-side date cutoff: only ask CDC for items published in the last
+    # 180 days. Pushes the freshness filter upstream so MMWR weekly podcast
+    # recap episodes ("Week of March 17, 2025" style) and other historical
+    # entries never come down the wire. Belt-and-suspenders date check below
+    # catches anything that slips through (e.g. if the API silently ignores
+    # this param on certain query shapes).
+    cutoff_dt = datetime.utcnow() - timedelta(days=180)
+    cutoff_iso = cutoff_dt.strftime("%Y-%m-%d")
+
     # Query 1: topic-based — catches CDC-tagged outbreak content cleanly.
     topic_params = {
         "topic": "Outbreaks",
         "sort": "-datePublished",
         "max": str(limit),
+        "contentPublishedSinceDate": cutoff_iso,
     }
     for item in _cdc_fetch(topic_params, headers, "topic"):
         if not isinstance(item, dict):
@@ -847,6 +861,7 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
         "q": "outbreak",
         "sort": "-datePublished",
         "max": str(limit),
+        "contentPublishedSinceDate": cutoff_iso,
     }
     for item in _cdc_fetch(q_params, headers, "q"):
         if not isinstance(item, dict):
@@ -873,8 +888,21 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
                     continue
                 oid = "cdc_syn_" + str(mid)
 
-                name = str(rec.get("name") or "").strip()
+                # Raw name from CDC may contain HTML emphasis tags
+                # (e.g. "<em>Salmonella</em> Outbreak Linked to...").
+                # Strip before storing so the title and agent fields render
+                # as plain text in the UI rather than literal HTML.
+                raw_name = str(rec.get("name") or "").strip()
+                name = _strip_html(raw_name).strip()
                 if not name:
+                    skipped = skipped + 1
+                    continue
+
+                # Reject CDC's "A Week in MMWR" podcast recap episodes —
+                # they have titles like "Week of March 17, 2025" and pass
+                # the outbreak-term heuristic because their descriptions
+                # mention pathogens, but they're not outbreak alerts.
+                if name.lower().startswith("week of "):
                     skipped = skipped + 1
                     continue
 
@@ -891,6 +919,21 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
                           rec.get("dateContentPublished") or
                           rec.get("dateContentAuthored") or "").strip()
                 report_date = pub[:10] if len(pub) >= 10 else pub
+
+                # Belt-and-suspenders 180-day client-side cutoff. Even though
+                # we asked the API for contentPublishedSinceDate, if anything
+                # older slips through (different date fields, API quirk), we
+                # reject it here. OHW is about alerts, not history.
+                if report_date and len(report_date) >= 10:
+                    try:
+                        rec_dt = datetime.strptime(report_date[:10], "%Y-%m-%d")
+                        if rec_dt < cutoff_dt:
+                            skipped = skipped + 1
+                            continue
+                    except Exception:
+                        # Unparseable date — let it through rather than drop
+                        # a potentially real outbreak on a parsing edge case.
+                        pass
 
                 # Source URL — link to the original CDC article.
                 report_url = str(rec.get("sourceUrl") or
