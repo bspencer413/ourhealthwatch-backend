@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.16"
+API_VERSION = "0.1.17"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -1958,35 +1958,72 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
         with get_db() as conn:
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             like_state = "%" + state + "%"
+            # v0.1.17: when the searched state is a US state (or "United States"
+            # variant), expand outbreak matching to also surface nationwide US
+            # entries. Mirrors /places/{id}/events behavior — a place geocoded to
+            # Alabama has country_code='US' on its row, so its WHO DON branch
+            # matches country_code='US'. Search-events doesn't carry that field,
+            # so we derive it from the state lookup. Without this expansion, a
+            # state search returned 0 while the drawer for the same place
+            # returned the nationwide US WHO entries.
+            is_us = _is_us_state_or_country(state)
 
             outbreaks: list = []
             seen_oids = set()
 
             # CDC Content Syndication: state-level US data. Replaces the old
             # NORS branch in v0.1.13 — CDC syn is the live alert source.
-            c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                country_code, region, cases, report_date, report_url, summary, fetched_at
-                FROM oh_outbreaks
-                WHERE source = 'cdc_syn'
-                  AND (region ILIKE %s OR location ILIKE %s)
-                AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                (like_state, like_state))
+            # v0.1.17: for US-state searches, ALSO match rows tagged
+            # region/location='United States' (CDC's label for nationwide
+            # multistate outbreaks where no admin1Code was published).
+            if is_us:
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'cdc_syn'
+                      AND (region ILIKE %s OR location ILIKE %s
+                           OR region ILIKE 'United States' OR location ILIKE 'United States')
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state, like_state))
+            else:
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'cdc_syn'
+                      AND (region ILIKE %s OR location ILIKE %s)
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state, like_state))
             for r in c.fetchall():
                 if r["outbreak_id"] in seen_oids:
                     continue
                 seen_oids.add(r["outbreak_id"])
                 outbreaks.append(_serialize_outbreak_row(r))
 
-            # WHO DON: country-level (lights up when adapter ships)
-            c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                country_code, region, cases, report_date, report_url, summary, fetched_at
-                FROM oh_outbreaks
-                WHERE source = 'who_don'
-                  AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
-                AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                (like_state, state, like_state))
+            # WHO DON: country-level matching.
+            # v0.1.17: for US-state searches, fire the country_code='US' filter
+            # explicitly so nationwide WHO US entries surface (matches drawer
+            # behavior for any US-state place).
+            if is_us:
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'who_don'
+                      AND (country_code = 'US'
+                           OR region ILIKE 'United States'
+                           OR location ILIKE 'United States')
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
+            else:
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'who_don'
+                      AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state, state, like_state))
             for r in c.fetchall():
                 if r["outbreak_id"] in seen_oids:
                     continue
