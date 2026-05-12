@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.20"
+API_VERSION = "0.1.22"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -59,6 +59,14 @@ WHO_DON_FETCH_LIMIT = 50
 # matching is structured — no title parsing needed.
 CDC_SYN_URL = "https://tools.cdc.gov/api/v2/resources/media"
 CDC_SYN_FETCH_LIMIT = 50
+# v0.1.22: CDC Health Alert Network feed (media id 413690). HAN is CDC's
+# primary channel for urgent public health incidents — much more "alerty"
+# than the Newsroom outbreak notices we ingest as cdc_syn. Per Bill's call,
+# HAN merges INTO source='cdc_syn' so the existing search, drawer, and
+# firehose "CDC · US" tab pick up HAN advisories with zero new wiring.
+# Distinct ingest function for clarity + independent error handling.
+CDC_HAN_MEDIA_ID = 413690
+CDC_HAN_FETCH_LIMIT = 50
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -1138,6 +1146,185 @@ def ingest_cdc_outbreaks(limit: int = CDC_SYN_FETCH_LIMIT) -> dict:
     except Exception as e:
         update_ingest_log("cdc_syn", success=False, error=str(e))
         return {"source": "cdc_syn", "error": str(e), "inserted": inserted}
+
+
+# ── INGEST: CDC HEALTH ALERT NETWORK (urgent US health incidents) ────────────
+# HAN is CDC's primary channel for urgent public health alerts — the most
+# time-sensitive content CDC publishes. Examples include outbreak alerts,
+# clinical advisories, drug shortages, environmental health warnings. All
+# vetted as urgent enough to merit a CDC alert; we ingest ALL HAN content
+# (no pathogen-term filter like cdc_syn uses) because the curation already
+# happened upstream.
+#
+# Storage: source='cdc_syn' to MERGE with existing CDC syndication content
+# under one "CDC · US" bucket in the firehose. Outbreak_id prefix 'cdc_han_'
+# distinguishes the upstream origin in raw data for future analytics without
+# affecting any user-facing path.
+
+def ingest_cdc_han(limit: int = CDC_HAN_FETCH_LIMIT) -> dict:
+    """Pull CDC Health Alert Network advisories via the Content Syndication
+    API. HAN feed lives at media id 413690; child advisories are fetched via
+    parentid filter, sorted newest-first. Falls back to a text-search query
+    if the parentid path returns nothing (defensive — the API parameter
+    documentation says parentid is supported but real-world behavior on
+    feed pages varies).
+
+    Stored as source='cdc_syn' so the existing "CDC · US" tab, search SQL,
+    and drawer matching pick HAN up with zero new wiring. 180-day cutoff
+    via contentPublishedSinceDate (matches cdc_syn freshness rule).
+
+    Resilient: skips parse failures, never crashes the cron."""
+    headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
+    seen_ids = set()
+    all_items = []
+
+    cutoff_dt = datetime.utcnow() - timedelta(days=180)
+    cutoff_iso = cutoff_dt.strftime("%Y-%m-%d")
+
+    # Query 1: children of HAN feed (parentid=413690). Cleanest — pulls
+    # only HAN advisories, no noise.
+    parent_params = {
+        "parentid": str(CDC_HAN_MEDIA_ID),
+        "sort": "-datePublished",
+        "max": str(limit),
+        "contentPublishedSinceDate": cutoff_iso,
+    }
+    for item in _cdc_fetch(parent_params, headers, "han_parent"):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if mid is None or mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        all_items.append(item)
+
+    # Query 2: text fallback — catches any HAN advisory not surfaced by
+    # parentid filter, plus historical CDCHAN-tagged content that lives
+    # outside the feed page hierarchy.
+    q_params = {
+        "q": "HAN health alert network",
+        "sort": "-datePublished",
+        "max": str(limit),
+        "contentPublishedSinceDate": cutoff_iso,
+    }
+    for item in _cdc_fetch(q_params, headers, "han_q"):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if mid is None or mid in seen_ids:
+            continue
+        # Only include if title/desc actually references HAN — q matches
+        # broadly and could surface unrelated press releases.
+        nm = str(item.get("name") or "")
+        ds = str(item.get("description") or "")
+        blob = (nm + " " + ds).lower()
+        if "han" not in blob and "health alert network" not in blob:
+            continue
+        seen_ids.add(mid)
+        all_items.append(item)
+
+    if not all_items:
+        update_ingest_log("cdc_han", success=False, error="no results from either query")
+        return {"source": "cdc_han", "error": "no results from either query", "inserted": 0}
+
+    inserted = 0
+    skipped = 0
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in all_items:
+                mid = rec.get("id")
+                if mid is None:
+                    skipped = skipped + 1
+                    continue
+                # Stored as cdc_syn source but with 'cdc_han_' prefix in the
+                # outbreak_id so upstream lineage is preserved (and ON CONFLICT
+                # doesn't collide with regular cdc_syn rows even if media ids
+                # were to overlap, which they shouldn't).
+                oid = "cdc_han_" + str(mid)
+
+                raw_name = str(rec.get("name") or "").strip()
+                name = _strip_html(raw_name).strip()
+                if not name:
+                    skipped = skipped + 1
+                    continue
+
+                description = str(rec.get("description") or "")
+
+                # No pathogen-term filter for HAN — curated by CDC as urgent
+                # already. Ingest all.
+
+                # Date
+                pub = str(rec.get("datePublished") or
+                          rec.get("dateContentPublished") or
+                          rec.get("dateContentAuthored") or "").strip()
+                report_date = pub[:10] if len(pub) >= 10 else pub
+
+                # Client-side 180-day cutoff defense.
+                if report_date and len(report_date) >= 10:
+                    try:
+                        rec_dt = datetime.strptime(report_date[:10], "%Y-%m-%d")
+                        if rec_dt < cutoff_dt:
+                            skipped = skipped + 1
+                            continue
+                    except Exception:
+                        pass
+
+                # Source URL — HAN advisories live at emergency.cdc.gov/han/
+                report_url = str(rec.get("sourceUrl") or
+                                 rec.get("targetUrl") or
+                                 "https://emergency.cdc.gov/han/").strip()
+
+                # Geo from geoTags. HAN alerts are often nationwide; fall back
+                # to "United States" so country-level matching catches them.
+                state, country_code, country = _cdc_extract_geo(rec)
+                if state:
+                    region = state
+                    location = state
+                elif country_code == "US":
+                    region = "United States"
+                    location = "United States"
+                elif country:
+                    region = country
+                    location = country
+                else:
+                    # No geo at all — default to US since HAN is a US alert
+                    # network. Lets US-state and "North America" region
+                    # searches surface these.
+                    region = "United States"
+                    location = "United States"
+                    country_code = "US"
+
+                summary = _strip_html(description)[:500]
+                agent = name
+
+                try:
+                    c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
+                        country_code, region, ship_name, cruise_line, cases, report_date, report_url, summary, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (outbreak_id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            agent = EXCLUDED.agent,
+                            location = EXCLUDED.location,
+                            country_code = EXCLUDED.country_code,
+                            region = EXCLUDED.region,
+                            report_date = EXCLUDED.report_date,
+                            report_url = EXCLUDED.report_url,
+                            summary = EXCLUDED.summary,
+                            fetched_at = CURRENT_TIMESTAMP""",
+                        ("cdc_syn", oid, name, agent, location, country_code, region,
+                         None, None, None, report_date, report_url, summary,
+                         json.dumps(rec)))
+                    inserted = inserted + 1
+                except Exception as e:
+                    skipped = skipped + 1
+                    print("[cdc_han] skip " + oid + ": " + str(e))
+            conn.commit()
+        update_ingest_log("cdc_han", success=True, record_count=inserted)
+        return {"source": "cdc_han", "fetched": len(all_items), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        update_ingest_log("cdc_han", success=False, error=str(e))
+        return {"source": "cdc_han", "error": str(e), "inserted": inserted}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
@@ -2556,7 +2743,8 @@ async def admin_refresh_outbreaks(_admin=Depends(require_admin)):
     Returns per-source result dicts."""
     who_res = ingest_who_don()
     cdc_res = ingest_cdc_outbreaks()
-    return {"who_don": who_res, "cdc_syn": cdc_res, "ran_at": datetime.utcnow().isoformat()}
+    han_res = ingest_cdc_han()
+    return {"who_don": who_res, "cdc_syn": cdc_res, "cdc_han": han_res, "ran_at": datetime.utcnow().isoformat()}
 
 
 # ── CRON ──────────────────────────────────────────────────────────────────────
@@ -2592,6 +2780,12 @@ def run_watchlist_check():
     except Exception as e:
         print("[cron] cdc_syn exception: " + str(e))
         update_ingest_log("cdc_syn", success=False, error=str(e))
+    try:
+        han_res = ingest_cdc_han()
+        print("[cron] cdc_han: " + json.dumps(han_res))
+    except Exception as e:
+        print("[cron] cdc_han exception: " + str(e))
+        update_ingest_log("cdc_han", success=False, error=str(e))
     update_ingest_log("system", success=True, record_count=0)
 
 
