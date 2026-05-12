@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.26"
+API_VERSION = "0.1.27"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -73,16 +73,18 @@ CDC_SYN_FETCH_LIMIT = 50
 # Data Service API. Same underlying ICIS-FE&C data, well-documented and
 # alive (last refreshed May 5, 2026). Table-level access pattern:
 #   https://data.epa.gov/efservice/{TABLE}/{filter}/{rows}/{format}
-# We query ICIS_ENFORCEMENT (the formal enforcement actions table) with
-# defensive client-side date filtering since we're unsure about server
-# date filter syntax for this specific table.
-#
-# Storage: source='epa_enforce' in oh_outbreaks (case shape maps cleanly to
-# the OutbreakCard renderer — title=case name, location=state, summary=
-# program+outcome+penalty). Outbreak_id prefix 'epa_enforce_' preserves lineage.
-EPA_ENFORCE_URL = "https://data.epa.gov/efservice/ICIS_ENFORCEMENT/ROWS/0:200/JSON"
+# v0.1.27: ROWS/0:200 returned the OLDEST 200 cases (1990s-era) by primary
+# key order — all pre-cutoff for the 1-year UI filter, so they ingested
+# but were invisible to firehose/search/drawer. Fix: server-side date
+# filter on a likely date column (column name is unconfirmed; we try one
+# and the v0.1.27 response surfaces actual field names for iteration).
+EPA_ENFORCE_BASE = "https://data.epa.gov/efservice/ICIS_ENFORCEMENT"
+EPA_ENFORCE_DATE_COLUMN = "ACTIVITY_STATUS_DATE"
 EPA_ENFORCE_FETCH_LIMIT = 200
 EPA_ENFORCE_WINDOW_DAYS = 365
+# Kept for backwards compat with prior version's call site — built at
+# request time inside ingest_epa_enforce() so the date cutoff stays fresh.
+EPA_ENFORCE_URL = EPA_ENFORCE_BASE + "/ROWS/0:200/JSON"
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
 OH_REGIONS = [
@@ -1199,12 +1201,21 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
     success or failure."""
     headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
     cutoff_dt = datetime.utcnow() - timedelta(days=window_days)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+    # v0.1.27: server-side date filter via Envirofacts greaterThan operator.
+    # If EPA_ENFORCE_DATE_COLUMN doesn't exist on the table, the response
+    # will tell us — either an HTTP error or zero rows. The first record's
+    # field names are echoed back in the return dict so we can confirm the
+    # actual column names without DB access.
+    url = (EPA_ENFORCE_BASE + "/" + EPA_ENFORCE_DATE_COLUMN +
+           "/greaterThan/" + cutoff_str + "/ROWS/0:" + str(limit) + "/JSON")
     inserted = 0
     skipped = 0
+    first_keys: list = []
     try:
-        r = requests.get(EPA_ENFORCE_URL, headers=headers, timeout=60)
+        r = requests.get(url, headers=headers, timeout=60)
         if r.status_code != 200:
-            err = "HTTP " + str(r.status_code) + " " + r.text[:200]
+            err = "HTTP " + str(r.status_code) + " url=" + url + " body=" + r.text[:200]
             update_ingest_log("epa_enforce", success=False, error=err)
             return {"source": "epa_enforce", "error": err, "inserted": 0}
         try:
@@ -1256,6 +1267,11 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                 for k, v in rec.items():
                     if isinstance(k, str):
                         norm[k.upper()] = v
+                # v0.1.27: capture the first record's actual field names so the
+                # admin response surfaces them — lets us confirm column naming
+                # without DB access on the next iteration.
+                if not first_keys:
+                    first_keys = sorted(norm.keys())
 
                 # ID — multiple candidate keys for the unique enforcement record.
                 case_id = _get(norm, "ACTIVITY_ID", "ENF_IDENTIFIER",
@@ -1382,10 +1398,13 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     print("[epa_enforce] skip " + oid + ": " + str(e))
             conn.commit()
         update_ingest_log("epa_enforce", success=True, record_count=inserted)
-        return {"source": "epa_enforce", "fetched": len(items), "inserted": inserted, "skipped": skipped}
+        return {"source": "epa_enforce", "url": url, "fetched": len(items),
+                "inserted": inserted, "skipped": skipped,
+                "first_record_keys": first_keys}
     except Exception as e:
         update_ingest_log("epa_enforce", success=False, error=str(e))
-        return {"source": "epa_enforce", "error": str(e), "inserted": inserted}
+        return {"source": "epa_enforce", "url": url, "error": str(e),
+                "inserted": inserted, "first_record_keys": first_keys}
 
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
