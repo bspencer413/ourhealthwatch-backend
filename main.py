@@ -38,7 +38,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.18"
+API_VERSION = "0.1.19"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -621,6 +621,89 @@ WHO_DON_COUNTRIES = [
 _WHO_DON_COUNTRIES_LC = [(c.lower(), c) for c in WHO_DON_COUNTRIES]
 
 
+# v0.1.19: ISO 3166-1 alpha-2 code map for the WHO_DON_COUNTRIES list.
+# Used by ingest_who_don to populate the country_code column (was empty
+# through v0.1.18, which broke region search and US-state WHO matching),
+# and by /search-events region path to derive country names for SQL OR
+# clauses on the region/location columns.
+#
+# Note: both "United States" and "United States of America" map to "US".
+# WHO's title parser prefers the longer multi-word form so most stored
+# rows have region="United States of America"; both names are listed
+# here so region search builds OR clauses that match either variant.
+WHO_NAME_TO_CODE = {
+    "Democratic Republic of the Congo": "CD",
+    "United Arab Emirates": "AE", "United Kingdom": "GB",
+    "United States of America": "US", "United States": "US",
+    "Saint Vincent and the Grenadines": "VC",
+    "Saint Kitts and Nevis": "KN", "Sao Tome and Principe": "ST",
+    "Bosnia and Herzegovina": "BA", "Trinidad and Tobago": "TT",
+    "Antigua and Barbuda": "AG", "Central African Republic": "CF",
+    "Papua New Guinea": "PG", "Marshall Islands": "MH",
+    "Solomon Islands": "SB", "North Macedonia": "MK",
+    "North Korea": "KP", "South Korea": "KR", "South Sudan": "SS",
+    "South Africa": "ZA", "Saudi Arabia": "SA", "Sri Lanka": "LK",
+    "Sierra Leone": "SL", "Equatorial Guinea": "GQ",
+    "Guinea-Bissau": "GW", "Costa Rica": "CR", "Cote d'Ivoire": "CI",
+    "El Salvador": "SV", "Dominican Republic": "DO", "Burkina Faso": "BF",
+    "New Zealand": "NZ", "Cabo Verde": "CV", "Czech Republic": "CZ",
+    "Timor-Leste": "TL", "Cook Islands": "CK",
+    "Afghanistan": "AF", "Albania": "AL", "Algeria": "DZ", "Andorra": "AD",
+    "Angola": "AO", "Argentina": "AR", "Armenia": "AM", "Australia": "AU",
+    "Austria": "AT", "Azerbaijan": "AZ", "Bahamas": "BS", "Bahrain": "BH",
+    "Bangladesh": "BD", "Barbados": "BB", "Belarus": "BY", "Belgium": "BE",
+    "Belize": "BZ", "Benin": "BJ", "Bhutan": "BT", "Bolivia": "BO",
+    "Botswana": "BW", "Brazil": "BR", "Brunei": "BN", "Bulgaria": "BG",
+    "Burundi": "BI", "Cambodia": "KH", "Cameroon": "CM", "Canada": "CA",
+    "Chad": "TD", "Chile": "CL", "China": "CN", "Colombia": "CO",
+    "Comoros": "KM", "Croatia": "HR", "Cuba": "CU", "Cyprus": "CY",
+    "Denmark": "DK", "Djibouti": "DJ", "Dominica": "DM", "Ecuador": "EC",
+    "Egypt": "EG", "Eritrea": "ER", "Estonia": "EE", "Eswatini": "SZ",
+    "Ethiopia": "ET", "Fiji": "FJ", "Finland": "FI", "France": "FR",
+    "Gabon": "GA", "Gambia": "GM", "Georgia": "GE", "Germany": "DE",
+    "Ghana": "GH", "Greece": "GR", "Grenada": "GD", "Guatemala": "GT",
+    "Guinea": "GN", "Guyana": "GY", "Haiti": "HT", "Honduras": "HN",
+    "Hungary": "HU", "Iceland": "IS", "India": "IN", "Indonesia": "ID",
+    "Iran": "IR", "Iraq": "IQ", "Ireland": "IE", "Israel": "IL",
+    "Italy": "IT", "Jamaica": "JM", "Japan": "JP", "Jordan": "JO",
+    "Kazakhstan": "KZ", "Kenya": "KE", "Kiribati": "KI", "Kuwait": "KW",
+    "Kyrgyzstan": "KG", "Laos": "LA", "Latvia": "LV", "Lebanon": "LB",
+    "Lesotho": "LS", "Liberia": "LR", "Libya": "LY", "Liechtenstein": "LI",
+    "Lithuania": "LT", "Luxembourg": "LU", "Madagascar": "MG", "Malawi": "MW",
+    "Malaysia": "MY", "Maldives": "MV", "Mali": "ML", "Malta": "MT",
+    "Mauritania": "MR", "Mauritius": "MU", "Mexico": "MX", "Micronesia": "FM",
+    "Moldova": "MD", "Monaco": "MC", "Mongolia": "MN", "Montenegro": "ME",
+    "Morocco": "MA", "Mozambique": "MZ", "Myanmar": "MM", "Namibia": "NA",
+    "Nauru": "NR", "Nepal": "NP", "Netherlands": "NL", "Nicaragua": "NI",
+    "Niger": "NE", "Nigeria": "NG", "Norway": "NO", "Oman": "OM",
+    "Pakistan": "PK", "Palau": "PW", "Palestine": "PS", "Panama": "PA",
+    "Paraguay": "PY", "Peru": "PE", "Philippines": "PH", "Poland": "PL",
+    "Portugal": "PT", "Qatar": "QA", "Romania": "RO", "Russia": "RU",
+    "Rwanda": "RW", "Saint Lucia": "LC", "Samoa": "WS", "San Marino": "SM",
+    "Senegal": "SN", "Serbia": "RS", "Seychelles": "SC", "Singapore": "SG",
+    "Slovakia": "SK", "Slovenia": "SI", "Somalia": "SO", "Spain": "ES",
+    "Sudan": "SD", "Suriname": "SR", "Sweden": "SE", "Switzerland": "CH",
+    "Syria": "SY", "Taiwan": "TW", "Tajikistan": "TJ", "Tanzania": "TZ",
+    "Thailand": "TH", "Togo": "TG", "Tonga": "TO", "Tunisia": "TN",
+    "Turkey": "TR", "Turkmenistan": "TM", "Tuvalu": "TV", "Uganda": "UG",
+    "Ukraine": "UA", "Uruguay": "UY", "Uzbekistan": "UZ", "Vanuatu": "VU",
+    "Venezuela": "VE", "Vietnam": "VN", "Yemen": "YE", "Zambia": "ZM",
+    "Zimbabwe": "ZW", "Congo": "CG",
+}
+
+# Inverse for code -> display name lookup. Used by /search-events region
+# path to translate REGION_TO_COUNTRY_CODES into name lists for WHO SQL
+# OR clauses (since existing WHO DON rows may still have empty country_code
+# until /admin/refresh-outbreaks is called post-deploy).
+# Where multiple names map to the same code (e.g. both US names), the
+# *first* insertion wins; we want the canonical WHO long form when one
+# exists, so insert "United States of America" before "United States".
+WHO_CODE_TO_NAME = {}
+for _nm, _cc in WHO_NAME_TO_CODE.items():
+    if _cc not in WHO_CODE_TO_NAME:
+        WHO_CODE_TO_NAME[_cc] = _nm
+
+
 def _extract_country_from_title(title: str) -> str:
     """Find the first known country name appearing as a whole word in the title.
     Returns the canonical display form or '' if none matched. Order of
@@ -735,6 +818,13 @@ def ingest_who_don(limit: int = WHO_DON_FETCH_LIMIT) -> dict:
                 # a later pass can split on dashes for cleaner separation.
                 agent = title
 
+                # v0.1.19: derive ISO country code from the parsed country name
+                # so country_code is actually populated (was always empty
+                # through v0.1.18 — broke region search and US-state WHO match
+                # in /search-events). Unknown countries fall back to "" so
+                # existing matching by region name still works.
+                country_code = WHO_NAME_TO_CODE.get(country, "")
+
                 try:
                     c.execute("""INSERT INTO oh_outbreaks (source, outbreak_id, title, agent, location,
                         country_code, region, ship_name, cruise_line, cases, report_date, report_url, summary, raw_json)
@@ -743,12 +833,13 @@ def ingest_who_don(limit: int = WHO_DON_FETCH_LIMIT) -> dict:
                             title = EXCLUDED.title,
                             agent = EXCLUDED.agent,
                             location = EXCLUDED.location,
+                            country_code = EXCLUDED.country_code,
                             region = EXCLUDED.region,
                             report_date = EXCLUDED.report_date,
                             report_url = EXCLUDED.report_url,
                             summary = EXCLUDED.summary,
                             fetched_at = CURRENT_TIMESTAMP""",
-                        ("who_don", oid, title, agent, country, "", country,
+                        ("who_don", oid, title, agent, country, country_code, country,
                          None, None, None, report_date, report_url, summary,
                          json.dumps(rec)))
                     inserted = inserted + 1
@@ -2044,7 +2135,7 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                         FROM oh_outbreaks
                         WHERE source = 'cdc_syn'
                           AND (region ILIKE %s OR location ILIKE %s
-                               OR region ILIKE 'United States' OR location ILIKE 'United States')
+                               OR region ILIKE '%United States%' OR location ILIKE '%United States%')
                         AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                         ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
                         (like_state, like_state))
@@ -2070,8 +2161,8 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                         FROM oh_outbreaks
                         WHERE source = 'who_don'
                           AND (country_code = 'US'
-                               OR region ILIKE 'United States'
-                               OR location ILIKE 'United States')
+                               OR region ILIKE '%United States%'
+                               OR location ILIKE '%United States%')
                         AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                         ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
                 else:
@@ -2165,23 +2256,43 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                     if codes:
                         codes_list = sorted(codes)  # stable ordering for query plans
                         placeholders = ",".join(["%s"] * len(codes_list))
-                        # WHO DON: country_code IN (region's codes).
+                        # v0.1.19: derive country names for the region too.
+                        # WHO DON rows ingested before v0.1.19 have empty
+                        # country_code, so we MUST also match by region/location
+                        # name. Post /admin/refresh-outbreaks, country_code IN
+                        # also fires (belt-and-suspenders).
+                        names_list = sorted(
+                            WHO_CODE_TO_NAME[cc] for cc in codes_list
+                            if cc in WHO_CODE_TO_NAME
+                        )
+                        name_ors = []
+                        name_params: list = []
+                        for nm in names_list:
+                            name_ors.append("region ILIKE %s")
+                            name_params.append("%" + nm + "%")
+                            name_ors.append("location ILIKE %s")
+                            name_params.append("%" + nm + "%")
+                        # WHO DON: country_code IN (codes) OR region/location ILIKE any name.
+                        who_where = "country_code IN (" + placeholders + ")"
+                        if name_ors:
+                            who_where = who_where + " OR " + " OR ".join(name_ors)
                         c.execute("""SELECT id, source, outbreak_id, title, agent, location,
                             country_code, region, cases, report_date, report_url, summary, fetched_at
                             FROM oh_outbreaks
                             WHERE source = 'who_don'
-                              AND country_code IN (""" + placeholders + """)
+                              AND (""" + who_where + """)
                             AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
                             ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                            tuple(codes_list))
+                            tuple(codes_list) + tuple(name_params))
                         for r in c.fetchall():
                             if r["outbreak_id"] in seen_oids:
                                 continue
                             seen_oids.add(r["outbreak_id"])
                             outbreaks.append(_serialize_outbreak_row(r))
-                        # CDC syn: country_code IN (region's codes). Mostly lights up
-                        # for North America (since CDC syn is US-centric); other
-                        # regions return 0 rows here, which is fine.
+                        # CDC syn: country_code IN (region's codes). CDC syn
+                        # adapter populated country_code from geoTags from day
+                        # one, so this works without a backfill. Mostly lights
+                        # up for North America (CDC syn is US-centric).
                         c.execute("""SELECT id, source, outbreak_id, title, agent, location,
                             country_code, region, cases, report_date, report_url, summary, fetched_at
                             FROM oh_outbreaks
