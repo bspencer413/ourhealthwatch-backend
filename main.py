@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.27"
+API_VERSION = "0.1.28"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -78,12 +78,38 @@ CDC_SYN_FETCH_LIMIT = 50
 # but were invisible to firehose/search/drawer. Fix: server-side date
 # filter on a likely date column (column name is unconfirmed; we try one
 # and the v0.1.27 response surfaces actual field names for iteration).
+# v0.1.28: probe of actual Envirofacts ICIS_ENFORCEMENT response revealed:
+#   - column is 'created_date' (not ACTIVITY_STATUS_DATE — that doesn't exist)
+#   - title is 'enf_name' (defendant name)
+#   - summary is 'enf_summary_text' (padded with whitespace + trailing *)
+#   - penalty is 'total_penalty_assessed_amt' (integer cents/dollars)
+#   - 'enf_identifier' prefix encodes EPA Region ("02-2001-7902" → Region 02)
+#   - ICIS_ENFORCEMENT itself has NO state/city column — must join to
+#     ICIS_FACILITY_INTEREST for facility geography
+# Fix: sort by created_date desc + filter by created_date + join. Falls back
+# to EPA Region full-state-name string (so state-name search in OHW still
+# matches even when the join doesn't bring back facility data).
 EPA_ENFORCE_BASE = "https://data.epa.gov/efservice/ICIS_ENFORCEMENT"
-EPA_ENFORCE_DATE_COLUMN = "ACTIVITY_STATUS_DATE"
+EPA_ENFORCE_DATE_COLUMN = "created_date"
+EPA_ENFORCE_JOIN_TABLE = "ICIS_FACILITY_INTEREST"
 EPA_ENFORCE_FETCH_LIMIT = 200
 EPA_ENFORCE_WINDOW_DAYS = 365
-# Kept for backwards compat with prior version's call site — built at
-# request time inside ingest_epa_enforce() so the date cutoff stays fresh.
+# EPA Region code → full state-name list. Used as fallback region when the
+# join doesn't surface facility-level state. Includes full names so OHW's
+# state-name search (e.g. "Texas") still ILIKE-matches these records.
+EPA_REGION_TO_STATES = {
+    "01": "Connecticut, Maine, Massachusetts, New Hampshire, Rhode Island, Vermont",
+    "02": "New Jersey, New York, Puerto Rico, Virgin Islands",
+    "03": "Delaware, District of Columbia, Maryland, Pennsylvania, Virginia, West Virginia",
+    "04": "Alabama, Florida, Georgia, Kentucky, Mississippi, North Carolina, South Carolina, Tennessee",
+    "05": "Illinois, Indiana, Michigan, Minnesota, Ohio, Wisconsin",
+    "06": "Arkansas, Louisiana, New Mexico, Oklahoma, Texas",
+    "07": "Iowa, Kansas, Missouri, Nebraska",
+    "08": "Colorado, Montana, North Dakota, South Dakota, Utah, Wyoming",
+    "09": "Arizona, California, Hawaii, Nevada",
+    "10": "Alaska, Idaho, Oregon, Washington",
+}
+# Kept for back-compat; built freshly inside ingest_epa_enforce().
 EPA_ENFORCE_URL = EPA_ENFORCE_BASE + "/ROWS/0:200/JSON"
 
 # v0.1.7: same 12-region taxonomy as Cruise Ship Watch / EarthWatch — covers the Earth.
@@ -1202,13 +1228,17 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
     headers = {"User-Agent": "OurHealthWatch/0.1 (ourhealth.watch)"}
     cutoff_dt = datetime.utcnow() - timedelta(days=window_days)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
-    # v0.1.27: server-side date filter via Envirofacts greaterThan operator.
-    # If EPA_ENFORCE_DATE_COLUMN doesn't exist on the table, the response
-    # will tell us — either an HTTP error or zero rows. The first record's
-    # field names are echoed back in the return dict so we can confirm the
-    # actual column names without DB access.
+    # v0.1.28: sort by created_date desc to get the NEWEST records first
+    # (the v0.1.26/27 URL returned oldest cases by primary-key order). Join
+    # ICIS_FACILITY_INTEREST so we can pick up facility-level state. If the
+    # join silently drops state fields, the parser falls back to deriving
+    # EPA Region from enf_identifier prefix and looking up the region's
+    # member states via EPA_REGION_TO_STATES.
     url = (EPA_ENFORCE_BASE + "/" + EPA_ENFORCE_DATE_COLUMN +
-           "/greaterThan/" + cutoff_str + "/ROWS/0:" + str(limit) + "/JSON")
+           "/greaterThan/" + cutoff_str +
+           "/sort/" + EPA_ENFORCE_DATE_COLUMN + ":desc" +
+           "/join/" + EPA_ENFORCE_JOIN_TABLE +
+           "/ROWS/0:" + str(limit) + "/JSON")
     inserted = 0
     skipped = 0
     first_keys: list = []
@@ -1282,16 +1312,25 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     continue
                 oid = "epa_enforce_" + case_id[:120]
 
-                # Title — case name / activity name / defendant.
-                title = _get(norm, "CASE_NAME", "ACTIVITY_NAME",
-                             "ENF_CONCLUSION_NAME", "DEFENDANT_ENTITY",
-                             "DEFENDANT_NAME", "FACILITY_NAME")
+                # Title — case name / activity name / defendant. v0.1.28: ENF_NAME
+                # is the actual defendant name on ICIS_ENFORCEMENT (e.g. "MILLIE'S
+                # AUTO REPAIR"); checked first now. ICIS text fields are often
+                # padded — defer the cleanup helper definition to after the
+                # title is picked (helper is defined below) and apply it via
+                # str.split/strip pattern inline.
+                title_raw = _get(norm, "ENF_NAME", "CASE_NAME", "ACTIVITY_NAME",
+                                 "ENF_CONCLUSION_NAME", "DEFENDANT_ENTITY",
+                                 "DEFENDANT_NAME", "FACILITY_NAME",
+                                 "COURT_ENF_NAME", "DOJ_ENF_NAME")
+                title = " ".join(title_raw.split()).strip(" *.").strip() if title_raw else ""
                 if not title:
                     title = "EPA Enforcement Action " + case_id
 
-                # State — facility location.
+                # State — facility location. From the join with
+                # ICIS_FACILITY_INTEREST if present.
                 state_name = _get(norm, "FACILITY_STATE", "STATE",
-                                  "STATE_CODE", "DEFENDANT_STATE")
+                                  "STATE_CODE", "DEFENDANT_STATE",
+                                  "FAC_STATE", "FAC_STATE_CODE")
                 # Expand 2-letter state codes to full names (matches CDC syn
                 # pattern so /search-events region ILIKE %state% works cleanly).
                 if len(state_name) == 2:
@@ -1299,11 +1338,33 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     if full:
                         state_name = full
 
-                city_name = _get(norm, "FACILITY_CITY", "CITY", "DEFENDANT_CITY")
-                if city_name and state_name:
+                city_name = _get(norm, "FACILITY_CITY", "CITY", "DEFENDANT_CITY",
+                                 "FAC_CITY", "FAC_CITY_NAME")
+
+                # v0.1.28: if the join didn't surface a state, derive EPA Region
+                # from enf_identifier prefix and put full member-state names
+                # into 'region' so OHW's state-name ILIKE search still matches.
+                # enf_identifier format: "RR-YYYY-NNNN" where RR = 2-digit
+                # region code (01-10) or HQ/EF/WF (HQ + mobile-source offices).
+                enf_id = _get(norm, "ENF_IDENTIFIER")
+                region_code = ""
+                region_states = ""
+                if enf_id and len(enf_id) >= 2:
+                    region_code = enf_id[:2]
+                    region_states = EPA_REGION_TO_STATES.get(region_code, "")
+                if not state_name and region_states:
+                    # Fallback search-region: full state-name list so ILIKE
+                    # ('texas','california',etc) still matches these records.
+                    state_name = region_states
+
+                # Display location: city/state when we have it; otherwise
+                # show the EPA Region label so the card has geo context.
+                if city_name and state_name and state_name != region_states:
                     location = city_name + ", " + state_name
-                elif state_name:
+                elif state_name and state_name != region_states:
                     location = state_name
+                elif region_code and region_states:
+                    location = "EPA Region " + region_code + " (" + region_states + ")"
                 elif city_name:
                     location = city_name
                 else:
@@ -1313,7 +1374,11 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                 country_code = "US"
 
                 # Date — try multiple candidates; first one that parses wins.
-                date_raw = _get(norm, "ACHIEVED_DATE", "SETTLEMENT_DATE_ENTERED",
+                # v0.1.28: CREATED_DATE and LAST_UPDATED_DATE confirmed present
+                # in probe response; checked first.
+                date_raw = _get(norm, "CREATED_DATE", "LAST_UPDATED_DATE",
+                                "UPDATED_DATE", "ACHIEVED_DATE",
+                                "SETTLEMENT_DATE_ENTERED", "FILED_DATE",
                                 "ACTIVITY_STATUS_DATE", "LAST_CHANGED_DATE",
                                 "CASE_FILED_DATE", "FY_DATE")
                 report_date = ""
@@ -1341,38 +1406,48 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     except Exception:
                         pass
 
-                # Source URL — ECHO case report uses the activity_id / enf_id.
+                # URL — link to ECHO case report.
                 report_url = ("https://echo.epa.gov/enforcement-case-report?id=" +
                               case_id)
 
-                # Summary — program + type + outcome + penalty, whatever's
-                # populated. ENF_SUMMARY_TEXT if available is best.
-                summary_text = _get(norm, "ENF_SUMMARY_TEXT", "SUMMARY")
+                # Helper: ICIS summary text is space-padded and trailing-asterisk
+                # padded (e.g., "FIELD CITATION.                            * ").
+                # Collapse internal whitespace and trim asterisks/spaces.
+                def _clean(s):
+                    if not s:
+                        return ""
+                    # Replace runs of whitespace with single space, strip *.
+                    cleaned = " ".join(str(s).split())
+                    return cleaned.strip(" *.").strip()
+
+                # Summary — ENF_SUMMARY_TEXT first (real text), then composed
+                # from outcome/branch/penalty/region as backup so card always
+                # has informative content.
+                summary_text = _clean(_get(norm, "ENF_SUMMARY_TEXT", "SUMMARY"))
+                parts = []
                 if summary_text:
-                    summary = summary_text[:500]
-                else:
-                    program = _get(norm, "PROGRAM_DESC", "PRIMARY_LAW")
-                    enf_type = _get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC",
-                                    "CASE_TYPE")
-                    outcome = _get(norm, "ENF_OUTCOME_DESC")
-                    penalty = _get(norm, "FEDERAL_PENALTY_ASSESSED_AMT",
-                                   "FED_PENALTY_ASSESSED_AMT",
-                                   "PENALTY_ASSESSED_AMT", "PENALTY_AMOUNT")
-                    parts = []
-                    if enf_type:
-                        parts.append(enf_type)
-                    if program:
-                        parts.append(program)
-                    if outcome:
-                        parts.append(outcome)
-                    if penalty:
-                        parts.append("Penalty: $" + penalty)
-                    summary = " - ".join(parts)[:500]
+                    parts.append(summary_text)
+                outcome_code = _get(norm, "ENF_OUTCOME_CODE", "ENF_OUTCOME_DESC")
+                if outcome_code:
+                    parts.append("Outcome: " + outcome_code)
+                # v0.1.28: real penalty column is total_penalty_assessed_amt.
+                penalty = _get(norm, "TOTAL_PENALTY_ASSESSED_AMT",
+                               "FEDERAL_PENALTY_ASSESSED_AMT",
+                               "FED_PENALTY_ASSESSED_AMT",
+                               "PENALTY_ASSESSED_AMT", "PENALTY_AMOUNT")
+                if penalty and penalty != "0" and penalty != "None":
+                    parts.append("Penalty: $" + penalty)
+                if region_code and region_states and (region_code or region_states):
+                    parts.append("EPA Region " + region_code)
+                summary = " - ".join(parts)[:500]
 
                 # Agent — what kind of action (renders as the green pill on
-                # OutbreakCard, same slot as pathogen for outbreaks).
-                agent = (_get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC") or
-                         _get(norm, "PROGRAM_DESC", "PRIMARY_LAW") or
+                # OutbreakCard, same slot as pathogen for outbreaks). Prefer
+                # real desc, fall back to code, then generic.
+                agent = (_get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC",
+                              "ENF_OUTCOME_DESC") or
+                         _get(norm, "PROGRAM_DESC", "PRIMARY_LAW",
+                              "HQ_DIVISION") or
                          "Enforcement action")
 
                 try:
