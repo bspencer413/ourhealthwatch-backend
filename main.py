@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.28"
+API_VERSION = "0.1.29"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -89,9 +89,9 @@ CDC_SYN_FETCH_LIMIT = 50
 # Fix: sort by created_date desc + filter by created_date + join. Falls back
 # to EPA Region full-state-name string (so state-name search in OHW still
 # matches even when the join doesn't bring back facility data).
-EPA_ENFORCE_BASE = "https://data.epa.gov/efservice/ICIS_ENFORCEMENT"
+EPA_ENFORCE_BASE = "https://data.epa.gov/efservice/icis.icis_enforcement"
 EPA_ENFORCE_DATE_COLUMN = "created_date"
-EPA_ENFORCE_JOIN_TABLE = "ICIS_FACILITY_INTEREST"
+EPA_ENFORCE_JOIN_TABLE = "icis.icis_facility_interest"
 EPA_ENFORCE_FETCH_LIMIT = 200
 EPA_ENFORCE_WINDOW_DAYS = 365
 # EPA Region code → full state-name list. Used as fallback region when the
@@ -1234,11 +1234,15 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
     # join silently drops state fields, the parser falls back to deriving
     # EPA Region from enf_identifier prefix and looking up the region's
     # member states via EPA_REGION_TO_STATES.
+    # v0.1.29: switched to Envirofacts v2 URL dialect — lowercase
+    # schema.table, /operator/value/ filters, no /ROWS/ prefix, lowercase
+    # /json format. The v1 ROWS/JSON pattern silently routes greaterThan
+    # to the value slot ("time data 'greaterThan' does not match format").
     url = (EPA_ENFORCE_BASE + "/" + EPA_ENFORCE_DATE_COLUMN +
            "/greaterThan/" + cutoff_str +
            "/sort/" + EPA_ENFORCE_DATE_COLUMN + ":desc" +
            "/join/" + EPA_ENFORCE_JOIN_TABLE +
-           "/ROWS/0:" + str(limit) + "/JSON")
+           "/0:" + str(limit) + "/json")
     inserted = 0
     skipped = 0
     first_keys: list = []
