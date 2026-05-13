@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.29"
+API_VERSION = "0.1.30"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -1234,14 +1234,13 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
     # join silently drops state fields, the parser falls back to deriving
     # EPA Region from enf_identifier prefix and looking up the region's
     # member states via EPA_REGION_TO_STATES.
-    # v0.1.29: switched to Envirofacts v2 URL dialect — lowercase
-    # schema.table, /operator/value/ filters, no /ROWS/ prefix, lowercase
-    # /json format. The v1 ROWS/JSON pattern silently routes greaterThan
-    # to the value slot ("time data 'greaterThan' does not match format").
+    # v0.1.30: Envirofacts v2 requires clause order
+    # table/filter/join/sort/range/format. v0.1.29 had sort before join
+    # which produces "Unexpected token JOIN". Swap fixes the cron.
     url = (EPA_ENFORCE_BASE + "/" + EPA_ENFORCE_DATE_COLUMN +
            "/greaterThan/" + cutoff_str +
-           "/sort/" + EPA_ENFORCE_DATE_COLUMN + ":desc" +
            "/join/" + EPA_ENFORCE_JOIN_TABLE +
+           "/sort/" + EPA_ENFORCE_DATE_COLUMN + ":desc" +
            "/0:" + str(limit) + "/json")
     inserted = 0
     skipped = 0
@@ -1316,15 +1315,14 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                     continue
                 oid = "epa_enforce_" + case_id[:120]
 
-                # Title — case name / activity name / defendant. v0.1.28: ENF_NAME
-                # is the actual defendant name on ICIS_ENFORCEMENT (e.g. "MILLIE'S
-                # AUTO REPAIR"); checked first now. ICIS text fields are often
-                # padded — defer the cleanup helper definition to after the
-                # title is picked (helper is defined below) and apply it via
-                # str.split/strip pattern inline.
-                title_raw = _get(norm, "ENF_NAME", "CASE_NAME", "ACTIVITY_NAME",
-                                 "ENF_CONCLUSION_NAME", "DEFENDANT_ENTITY",
-                                 "DEFENDANT_NAME", "FACILITY_NAME",
+                # Title — defendant/facility name. v0.1.30: probed data shows
+                # FACILITY_NAME (e.g. "MAPLE CREST PLAT #4") is the actual
+                # site/defendant when the join surfaces it. ENF_NAME varies —
+                # sometimes defendant ("MILLIE'S AUTO REPAIR"), sometimes the
+                # action type ("Warning Letter (NPDES)"). Prefer FACILITY_NAME.
+                title_raw = _get(norm, "FACILITY_NAME", "ENF_NAME", "CASE_NAME",
+                                 "ACTIVITY_NAME", "ENF_CONCLUSION_NAME",
+                                 "DEFENDANT_ENTITY", "DEFENDANT_NAME",
                                  "COURT_ENF_NAME", "DOJ_ENF_NAME")
                 title = " ".join(title_raw.split()).strip(" *.").strip() if title_raw else ""
                 if not title:
@@ -1446,12 +1444,14 @@ def ingest_epa_enforce(limit: int = EPA_ENFORCE_FETCH_LIMIT,
                 summary = " - ".join(parts)[:500]
 
                 # Agent — what kind of action (renders as the green pill on
-                # OutbreakCard, same slot as pathogen for outbreaks). Prefer
-                # real desc, fall back to code, then generic.
-                agent = (_get(norm, "ENF_TYPE_DESC", "ACTIVITY_TYPE_DESC",
-                              "ENF_OUTCOME_DESC") or
-                         _get(norm, "PROGRAM_DESC", "PRIMARY_LAW",
-                              "HQ_DIVISION") or
+                # OutbreakCard). v0.1.30: PGM_SYS_ACRNM is the EPA program
+                # code (NPDES/RCRA/CAA/SDWA) — most recognizable to users.
+                # ENF_NAME is good fallback because it's often the action
+                # type when FACILITY_NAME claimed the title slot.
+                agent = (_get(norm, "PGM_SYS_ACRNM", "ENF_TYPE_DESC",
+                              "ACTIVITY_TYPE_DESC", "ENF_OUTCOME_DESC",
+                              "PROGRAM_DESC", "PRIMARY_LAW", "HQ_DIVISION",
+                              "ENF_NAME") or
                          "Enforcement action")
 
                 try:
