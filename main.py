@@ -40,7 +40,7 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@ourhealth.watch")
 # v0.1.7: geocoding for place-based watchlist (Search by region/state/city).
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-API_VERSION = "0.1.30"
+API_VERSION = "0.1.31"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
@@ -2472,28 +2472,20 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                 is_us = _is_us_state_or_country(state)
 
                 # CDC Content Syndication: state-level US data.
-                # v0.1.17: for US-state searches, ALSO match rows tagged
-                # region/location='United States' (CDC's label for nationwide
-                # multistate outbreaks where no admin1Code was published).
-                if is_us:
-                    c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                        country_code, region, cases, report_date, report_url, summary, fetched_at
-                        FROM oh_outbreaks
-                        WHERE source = 'cdc_syn'
-                          AND (region ILIKE %s OR location ILIKE %s
-                               OR region ILIKE '%%United States%%' OR location ILIKE '%%United States%%')
-                        AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                        ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                        (like_state, like_state))
-                else:
-                    c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                        country_code, region, cases, report_date, report_url, summary, fetched_at
-                        FROM oh_outbreaks
-                        WHERE source = 'cdc_syn'
-                          AND (region ILIKE %s OR location ILIKE %s)
-                        AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                        ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                        (like_state, like_state))
+                # v0.1.31: dropped the is_us nationwide-fallback that ORed in
+                # '%United States%'. That fallback flooded state-specific
+                # searches (e.g. "Hawaii") with every record tagged "United
+                # States". Multistate outbreaks without specific-state tags
+                # are still reachable via country-level search of "United
+                # States" — but won't pollute state-specific results.
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'cdc_syn'
+                      AND (region ILIKE %s OR location ILIKE %s)
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state, like_state))
                 for r in c.fetchall():
                     if r["outbreak_id"] in seen_oids:
                         continue
@@ -2501,25 +2493,22 @@ async def search_events(body: SearchQuery, user=Depends(require_user)):
                     outbreaks.append(_serialize_outbreak_row(r))
 
                 # WHO DON: country-level matching.
-                if is_us:
-                    c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                        country_code, region, cases, report_date, report_url, summary, fetched_at
-                        FROM oh_outbreaks
-                        WHERE source = 'who_don'
-                          AND (country_code = 'US'
-                               OR region ILIKE '%United States%'
-                               OR location ILIKE '%United States%')
-                        AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                        ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""")
-                else:
-                    c.execute("""SELECT id, source, outbreak_id, title, agent, location,
-                        country_code, region, cases, report_date, report_url, summary, fetched_at
-                        FROM oh_outbreaks
-                        WHERE source = 'who_don'
-                          AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
-                        AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
-                        ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
-                        (like_state, state, like_state))
+                # v0.1.31: dropped the is_us special case that returned every
+                # WHO US record (`country_code='US' OR region ILIKE '%United
+                # States%'`) on any US state search, without using the state
+                # parameter. State searches for US states now correctly
+                # return nothing from WHO unless the state name itself
+                # appears in region/location (WHO is country-level data; the
+                # user can search "United States" explicitly to see all US
+                # WHO entries).
+                c.execute("""SELECT id, source, outbreak_id, title, agent, location,
+                    country_code, region, cases, report_date, report_url, summary, fetched_at
+                    FROM oh_outbreaks
+                    WHERE source = 'who_don'
+                      AND (region ILIKE %s OR country_code ILIKE %s OR location ILIKE %s)
+                    AND report_date >= TO_CHAR(CURRENT_DATE - INTERVAL '1 year', 'YYYY-MM-DD')
+                    ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT 25""",
+                    (like_state, state, like_state))
                 for r in c.fetchall():
                     if r["outbreak_id"] in seen_oids:
                         continue
